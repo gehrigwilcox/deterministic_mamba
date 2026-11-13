@@ -1,5 +1,9 @@
 /******************************************************************************
  * Copyright (c) 2023, Tri Dao.
+ *
+ * Deterministic fork (based on mamba_ssm 2.2.4): the backward pass writes
+ * per-(batch, channel) partial gradients into float32 workspaces and reduces
+ * them with fixed-order kernels (det_reduce.cu) instead of atomicAdd.
  ******************************************************************************/
 
 #include <c10/cuda/CUDAGuard.h>
@@ -8,6 +12,9 @@
 #include <vector>
 
 #include "selective_scan.h"
+#include "../det_reduce.h"
+
+#include <algorithm>
 
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
@@ -39,12 +46,10 @@
         AT_ERROR(#NAME, " not implemented for weight type '", toString(WTYPE), "'"); \
     }
 
+// Deterministic fork: only real (float32) A is supported.
 #define DISPATCH_WTYPE_FLOAT_AND_COMPLEX(WTYPE, NAME, ...)                           \
     if (WTYPE == at::ScalarType::Float) {                                            \
        using weight_t = float;                                                       \
-        __VA_ARGS__();                                                               \
-    } else if (WTYPE == at::ScalarType::ComplexFloat) {                              \
-        using weight_t = c10::complex<float>;                                        \
         __VA_ARGS__();                                                               \
     } else {                                                                         \
         AT_ERROR(#NAME, " not implemented for weight type '", toString(WTYPE), "'"); \
@@ -233,7 +238,8 @@ selective_scan_fwd(const at::Tensor &u, const at::Tensor &delta,
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(weight_type == at::ScalarType::Float || weight_type == at::ScalarType::ComplexFloat);
+    TORCH_CHECK(weight_type == at::ScalarType::Float,
+                "deterministic_mamba: selective_scan only supports real float32 A (complex is not supported)");
 
     const bool is_variable_B = B.dim() >= 3;
     const bool is_variable_C = C.dim() >= 3;
@@ -346,11 +352,13 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
                   const c10::optional<at::Tensor> &out_,
                   c10::optional<at::Tensor> &dz_,
                   bool delta_softplus,
-                  bool recompute_out_z) {
+                  bool recompute_out_z,
+                  int64_t workspace_mb) {
     auto input_type = u.scalar_type();
     auto weight_type = A.scalar_type();
     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
-    TORCH_CHECK(weight_type == at::ScalarType::Float || weight_type == at::ScalarType::ComplexFloat);
+    TORCH_CHECK(weight_type == at::ScalarType::Float,
+                "deterministic_mamba: selective_scan only supports real float32 A (complex is not supported)");
 
     const bool is_variable_B = B.dim() >= 3;
     const bool is_variable_C = C.dim() >= 3;
@@ -457,13 +465,32 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
 
     at::Tensor du = torch::empty_like(u);
     at::Tensor ddelta = torch::empty_like(delta);
-    at::Tensor dA = torch::zeros_like(A);
-    at::Tensor dB = !is_variable_B ? torch::zeros_like(B) : torch::zeros_like(B, B.options().dtype(torch::kFloat32));
-    at::Tensor dC = !is_variable_C ? torch::zeros_like(C) : torch::zeros_like(C, C.options().dtype(torch::kFloat32));
-    at::Tensor dD;
-    if (D_.has_value()) { dD = torch::zeros_like(D_.value()); }
-    at::Tensor ddelta_bias;
-    if (delta_bias_.has_value()) { ddelta_bias = torch::zeros_like(delta_bias_.value()); }
+
+    // ---- Deterministic workspaces (float32, fully overwritten by the kernel) ----
+    auto fopts = u.options().dtype(torch::kFloat32);
+    at::Tensor dA_ws = torch::empty({batch_size, dim, dstate}, fopts);
+    at::Tensor dB_ws = !is_variable_B ? torch::empty({batch_size, dim, dstate}, fopts) : at::Tensor();
+    at::Tensor dC_ws = !is_variable_C ? torch::empty({batch_size, dim, dstate}, fopts) : at::Tensor();
+    at::Tensor dD_ws, ddelta_bias_ws;
+    if (D_.has_value()) { dD_ws = torch::empty({batch_size, dim}, fopts); }
+    if (delta_bias_.has_value()) { ddelta_bias_ws = torch::empty({batch_size, dim}, fopts); }
+
+    // Final float32 results for variable B / C: (batch, n_groups, dstate, seqlen).
+    at::Tensor dB_var = is_variable_B ? torch::empty({batch_size, n_groups, dstate, seqlen}, fopts) : at::Tensor();
+    at::Tensor dC_var = is_variable_C ? torch::empty({batch_size, n_groups, dstate, seqlen}, fopts) : at::Tensor();
+
+    // Channels of one group all contribute to the same dB/dC[b, g]. Each channel writes its own
+    // workspace row; channels are processed in slices so the workspace stays within the budget.
+    const int ratio = dim / n_groups;
+    const int n_var = int(is_variable_B) + int(is_variable_C);
+    int slice = ratio;
+    if (n_var > 0) {
+        const int64_t per_dim_bytes = int64_t(batch_size) * dstate * seqlen * 4 * n_var;
+        const int64_t budget = std::max<int64_t>(workspace_mb, 1) * 1024 * 1024;
+        slice = int(std::min<int64_t>(ratio, std::max<int64_t>(1, budget / per_dim_bytes)));
+    }
+    at::Tensor dB_slice_ws = is_variable_B ? torch::empty({batch_size, slice, dstate, seqlen}, fopts) : at::Tensor();
+    at::Tensor dC_slice_ws = is_variable_C ? torch::empty({batch_size, slice, dstate, seqlen}, fopts) : at::Tensor();
 
     SSMParamsBwd params;
     set_ssm_params_bwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
@@ -471,27 +498,59 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
                        D_.has_value() ? D_.value().data_ptr() : nullptr,
                        delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
                        x_.has_value() ? x_.value().data_ptr() : nullptr,
-                       dout, du, ddelta, dA, dB, dC, dz,
-                       D_.has_value() ? dD.data_ptr() : nullptr,
-                       delta_bias_.has_value() ? ddelta_bias.data_ptr() : nullptr,
+                       dout, du, ddelta,
+                       dA_ws,
+                       is_variable_B ? dB_slice_ws : dB_ws,
+                       is_variable_C ? dC_slice_ws : dC_ws,
+                       dz,
+                       D_.has_value() ? dD_ws.data_ptr() : nullptr,
+                       delta_bias_.has_value() ? ddelta_bias_ws.data_ptr() : nullptr,
                        has_z, delta_softplus, recompute_out_z);
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{u.device()};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(u.scalar_type(), "selective_scan_bwd", [&] {
-        DISPATCH_WTYPE_FLOAT_AND_COMPLEX(A.scalar_type(), "selective_scan_bwd", [&] {
-            selective_scan_bwd_cuda<input_t, weight_t>(params, stream);
-        });
-    });
-    std::vector<at::Tensor> result = {du, ddelta, dA, dB.to(B.dtype()), dC.to(C.dtype()), dD, ddelta_bias};
+    const int64_t bc_inner = int64_t(dstate) * seqlen;
+    for (int g = 0; g < n_groups; ++g) {
+        // With constant B and C there is no per-group workspace: one launch covers all channels.
+        const int g_begin = n_var > 0 ? g * ratio : 0;
+        const int g_end = n_var > 0 ? (g + 1) * ratio : dim;
+        for (int d0 = g_begin; d0 < g_end; d0 += slice) {
+            const int n = std::min(slice, g_end - d0);
+            params.dim_offset = d0;
+            params.n_local_dims = n;
+            DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(u.scalar_type(), "selective_scan_bwd", [&] {
+                DISPATCH_WTYPE_FLOAT_AND_COMPLEX(A.scalar_type(), "selective_scan_bwd", [&] {
+                    selective_scan_bwd_cuda<input_t, weight_t>(params, stream);
+                });
+            });
+            // Fold this slice of channels into dB/dC[:, g] in increasing channel order.
+            const bool accumulate = d0 != g_begin;
+            if (is_variable_B) {
+                det_sum_middle(dB_slice_ws.data_ptr<float>(), dB_var.data_ptr<float>() + g * bc_inner,
+                               batch_size, n, bc_inner, dB_slice_ws.stride(0), dB_slice_ws.stride(1),
+                               dB_var.stride(0), accumulate);
+            }
+            if (is_variable_C) {
+                det_sum_middle(dC_slice_ws.data_ptr<float>(), dC_var.data_ptr<float>() + g * bc_inner,
+                               batch_size, n, bc_inner, dC_slice_ws.stride(0), dC_slice_ws.stride(1),
+                               dC_var.stride(0), accumulate);
+            }
+        }
+        if (n_var == 0) { break; }
+    }
+
+    // Reduce the per-batch partials over the batch dimension in a fixed order.
+    at::Tensor dA = det_sum_dim0(dA_ws);
+    at::Tensor dB = is_variable_B ? dB_var.to(B.dtype()) : det_sum_dim0(dB_ws).to(B.dtype());
+    at::Tensor dC = is_variable_C ? dC_var.to(C.dtype()) : det_sum_dim0(dC_ws).to(C.dtype());
+    at::Tensor dD, ddelta_bias;
+    if (D_.has_value()) { dD = det_sum_dim0(dD_ws); }
+    if (delta_bias_.has_value()) { ddelta_bias = det_sum_dim0(ddelta_bias_ws); }
+
+    std::vector<at::Tensor> result = {du, ddelta, dA, dB, dC, dD, ddelta_bias};
     if (has_z) { result.push_back(dz); }
     if (recompute_out_z) { result.push_back(out_z); }
     return result;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fwd", &selective_scan_fwd, "Selective scan forward");
-    m.def("bwd", &selective_scan_bwd, "Selective scan backward");
 }

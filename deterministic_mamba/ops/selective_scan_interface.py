@@ -1,21 +1,23 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
+#
+# Deterministic fork of mamba_ssm 2.2.4's selective_scan_interface.py. Identical math and API;
+# the CUDA calls go to deterministic_mamba._C, whose backward kernels use no atomics.
 
 import torch
 import torch.nn.functional as F
-from mamba_ssm.utils.torch import custom_bwd, custom_fwd
+from deterministic_mamba.utils.torch import custom_bwd, custom_fwd
 
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn
-    import causal_conv1d_cuda
-except ImportError:
-    causal_conv1d_fn = None
-    causal_conv1d_cuda = None
+from deterministic_mamba import _C
+from deterministic_mamba.config import workspace_mb
+from deterministic_mamba.ops.causal_conv1d import causal_conv1d_fn
+from deterministic_mamba.ops.triton.layer_norm import _layer_norm_fwd
 
-from mamba_ssm.ops.triton.layer_norm import _layer_norm_fwd
 
-import selective_scan_cuda
+def _check_real(A):
+    if A.is_complex():
+        raise NotImplementedError("deterministic_mamba only supports real-valued A")
 
 
 class SelectiveScanFn(torch.autograd.Function):
@@ -41,7 +43,8 @@ class SelectiveScanFn(torch.autograd.Function):
         if C.dim() == 3:
             C = rearrange(C, "b dstate l -> b 1 dstate l")
             ctx.squeeze_C = True
-        out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus)
+        _check_real(A)
+        out, x, *rest = _C.selective_scan_fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus)
         ctx.delta_softplus = delta_softplus
         ctx.has_z = z is not None
         last_state = x[:, :, -1, 1::2]  # (batch, dim, dstate)
@@ -66,9 +69,10 @@ class SelectiveScanFn(torch.autograd.Function):
         # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
         # backward of selective_scan_cuda with the backward of chunk).
         # Here we just pass in None and dz will be allocated in the C++ code.
-        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(
+        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = _C.selective_scan_bwd(
             u, delta, A, B, C, D, z, delta_bias, dout, x, out, None, ctx.delta_softplus,
-            False  # option to recompute out_z, not used here
+            False,  # option to recompute out_z, not used here
+            workspace_mb(),
         )
         dz = rest[0] if ctx.has_z else None
         dB = dB.squeeze(1) if getattr(ctx, "squeeze_B", False) else dB
@@ -190,7 +194,7 @@ class MambaInnerFn(torch.autograd.Function):
         """
              xz: (batch, dim, seqlen)
         """
-        assert causal_conv1d_cuda is not None, "causal_conv1d_cuda is not available. Please install causal-conv1d."
+        _check_real(A)
         assert checkpoint_lvl in [0, 1]
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
@@ -206,9 +210,7 @@ class MambaInnerFn(torch.autograd.Function):
         conv1d_weight = rearrange(conv1d_weight, "d 1 w -> d w")
         x, z = xz.chunk(2, dim=1)
         conv1d_bias = conv1d_bias.contiguous() if conv1d_bias is not None else None
-        conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(
-            x, conv1d_weight, conv1d_bias, None, None, None, True
-        )
+        conv1d_out = _C.causal_conv1d_fwd(x, conv1d_weight, conv1d_bias, True)
         # We're being very careful here about the layout, to avoid extra transposes.
         # We want delta to have d as the slowest moving dimension
         # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
@@ -258,7 +260,7 @@ class MambaInnerFn(torch.autograd.Function):
             delta = rms_norm_forward(delta, dt_rms_weight, bias=None, eps=b_c_dt_rms_eps)
             delta = rearrange(delta, "(b l) d -> b d l", l=L).contiguous()
         
-        out, scan_intermediates, out_z = selective_scan_cuda.fwd(
+        out, scan_intermediates, out_z = _C.selective_scan_fwd(
             conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus
         )
         ctx.delta_softplus = delta_softplus
@@ -279,7 +281,6 @@ class MambaInnerFn(torch.autograd.Function):
     @custom_bwd
     def backward(ctx, dout):
         # dout: (batch, seqlen, dim)
-        assert causal_conv1d_cuda is not None, "causal_conv1d_cuda is not available. Please install causal-conv1d."
         (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight, out_proj_weight,
          conv1d_out, delta, A, B, C, D, delta_bias, scan_intermediates, b_rms_weight, c_rms_weight, dt_rms_weight, out) = ctx.saved_tensors
         L = xz.shape[-1]
@@ -289,9 +290,7 @@ class MambaInnerFn(torch.autograd.Function):
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
         if ctx.checkpoint_lvl == 1:
-            conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(
-                x, conv1d_weight, conv1d_bias, None, None, None, True
-            )
+            conv1d_out = _C.causal_conv1d_fwd(x, conv1d_weight, conv1d_bias, True)
             delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(),
                               "d (b l) -> b d l", l = L)
             if dt_rms_weight is not None:
@@ -319,10 +318,11 @@ class MambaInnerFn(torch.autograd.Function):
         dx, dz = dxz.chunk(2, dim=1)
         dout = rearrange(dout, "b l e -> e (b l)")
         dout_y = rearrange(out_proj_weight.t() @ dout, "d (b l) -> b d l", l=L)
-        dconv1d_out, ddelta, dA, dB, dC, dD, ddelta_bias, dz, out_z = selective_scan_cuda.bwd(
+        dconv1d_out, ddelta, dA, dB, dC, dD, ddelta_bias, dz, out_z = _C.selective_scan_bwd(
             conv1d_out, delta, A, B, C, D, z, delta_bias, dout_y, scan_intermediates, out, dz,
             ctx.delta_softplus,
-            True  # option to recompute out_z
+            True,  # option to recompute out_z
+            workspace_mb(),
         )
         dout_proj_weight = torch.einsum("eB,dB->ed", dout, rearrange(out_z, "b d l -> d (b l)"))
         dout_proj_bias = dout.sum(dim=(0, 1)) if not ctx.out_proj_bias_is_None else None
@@ -355,8 +355,8 @@ class MambaInnerFn(torch.autograd.Function):
         dconv1d_out = rearrange(dconv1d_out, "d (b l) -> b d l", b=x.shape[0], l=x.shape[-1])
         # The kernel supports passing in a pre-allocated dx (e.g., in case we want to fuse the
         # backward of conv1d with the backward of chunk).
-        dx, dconv1d_weight, dconv1d_bias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
-            x, conv1d_weight, conv1d_bias, dconv1d_out, None, None, None, dx, False, True
+        dx, dconv1d_weight, dconv1d_bias = _C.causal_conv1d_bwd(
+            x, conv1d_weight, conv1d_bias, dconv1d_out, dx, True
         )
         dconv1d_bias = dconv1d_bias if conv1d_bias is not None else None
         dconv1d_weight = rearrange(dconv1d_weight, "d w -> d 1 w")
@@ -385,7 +385,6 @@ def mamba_inner_ref(
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
     C_proj_bias=None, delta_softplus=True
 ):
-    assert causal_conv1d_fn is not None, "causal_conv1d_fn is not available. Please install causal-conv1d."
     L = xz.shape[-1]
     delta_rank = delta_proj_weight.shape[1]
     d_state = A.shape[-1] * (1 if not A.is_complex() else 2)

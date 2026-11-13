@@ -69,6 +69,11 @@ struct SSMParamsBase {
 };
 
 struct SSMParamsBwd: public SSMParamsBase {
+    // Deterministic fork: the bwd kernel is launched over channels
+    // [dim_offset, dim_offset + n_local_dims). All d* pointers point to float32 workspaces
+    // (see selective_scan_bwd_kernel.cuh) that are reduced on the host in a fixed order.
+    int dim_offset;
+    int n_local_dims;
     index_t dout_batch_stride;
     index_t dout_d_stride;
     index_t dA_d_stride;

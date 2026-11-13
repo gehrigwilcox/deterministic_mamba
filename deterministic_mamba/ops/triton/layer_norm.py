@@ -5,13 +5,19 @@
 # For the backward pass, we keep weight_grad and bias_grad in registers and accumulate.
 # This is faster for dimensions up to 8k, but after that it's much slower due to register spilling.
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
+#
+# Deterministic fork (mamba_ssm 2.2.4): the @triton.autotune over num_warps is removed. Autotuning
+# benchmarks configs at runtime and can pick a different num_warps in different processes, which
+# changes the reduction order inside tl.sum and hence the bits of the result. num_warps is now a
+# fixed function of BLOCK_N (see _num_warps). The backward dw/db reduction already uses a fixed
+# per-program buffer + torch sum (no atomics), so it is deterministic for a given GPU model.
 
 import math
 import warnings
 
 import torch
 import torch.nn.functional as F
-from mamba_ssm.utils.torch import custom_bwd, custom_fwd
+from deterministic_mamba.utils.torch import custom_bwd, custom_fwd
 
 import triton
 import triton.language as tl
@@ -166,10 +172,11 @@ configs_autotune = [
 
 pruned_configs_autotune = config_prune(configs_autotune)
 
-@triton.autotune(
-    configs = pruned_configs_autotune,
-    key=["N", "HAS_RESIDUAL", "STORE_RESIDUAL_OUT", "IS_RMS_NORM", "HAS_BIAS"],
-)
+
+def _num_warps(BLOCK_N):
+    # Fixed (not autotuned) launch configuration -> identical reduction order on every run.
+    return min(max(BLOCK_N // 256, 1), 8)
+
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
 # @triton.heuristics({"HAS_RESIDUAL": lambda args: args["RESIDUAL"] is not None})
 @triton.heuristics({"HAS_X1": lambda args: args["X1"] is not None})
@@ -366,7 +373,7 @@ def _layer_norm_fwd(
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
     with torch.cuda.device(x.device.index):
-        _layer_norm_fwd_1pass_kernel[(M,)](
+        _layer_norm_fwd_1pass_kernel[(M,)](  # num_warps passed below
             x,
             y,
             weight,
@@ -400,6 +407,7 @@ def _layer_norm_fwd(
             dropout_p > 0.0,
             dropout_mask is not None,
             rowscale is not None,
+            num_warps=_num_warps(BLOCK_N),
         )
     # residual_out is None if residual is None and residual_dtype == input_dtype and dropout_p == 0.0
     if dropout_mask is not None and x1 is not None:
@@ -418,10 +426,6 @@ def _layer_norm_fwd(
     )
 
 
-@triton.autotune(
-    configs=pruned_configs_autotune,
-    key=["N", "HAS_DRESIDUAL", "STORE_DRESIDUAL", "IS_RMS_NORM", "HAS_BIAS", "HAS_DROPOUT"],
-)
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
 # @triton.heuristics({"HAS_DRESIDUAL": lambda args: args["DRESIDUAL"] is not None})
 # @triton.heuristics({"STORE_DRESIDUAL": lambda args: args["DRESIDUAL_IN"] is not None})
@@ -706,6 +710,7 @@ def _layer_norm_bwd(
             dresidual_in is not None,
             bias is not None,
             dropout_p > 0.0,
+            num_warps=_num_warps(BLOCK_N),
         )
     dw = _dw.sum(0).to(weight.dtype)
     db = _db.sum(0).to(bias.dtype) if bias is not None else None
