@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import deterministic, n_unique
+from conftest import deterministic, n_unique, requires_mamba3_triton
 
 DEV = "cuda"
 
@@ -119,6 +119,7 @@ def _m3_run(inp, with_state_grad):
     return [out.detach().clone()] + [v.grad.clone() for v in inp.values()]
 
 
+@requires_mamba3_triton
 @pytest.mark.parametrize("with_state_grad", [False, True])
 @pytest.mark.parametrize("nheads_qk", [8, 2])  # 2 -> GQA ratio 4
 def test_mamba3_siso_bitwise_deterministic_and_close_to_default(with_state_grad, nheads_qk):
@@ -135,6 +136,7 @@ def test_mamba3_siso_bitwise_deterministic_and_close_to_default(with_state_grad,
         torch.testing.assert_close(a.float(), b.float(), rtol=2e-3, atol=1e-2 * max(1.0, b.abs().max().item()))
 
 
+@requires_mamba3_triton
 def test_mamba3_dk_state_post_default_mode_is_atomic_and_nondeterministic():
     """The upstream dK/dK_bias atomics (GQA + batch reduction) in default mode."""
     inp = _m3_inputs(batch=16, nheads=32, nheads_qk=4)

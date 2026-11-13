@@ -43,3 +43,21 @@ def n_unique(fn, runs=6) -> int:
 
 def cc():
     return torch.cuda.get_device_capability()
+
+
+def _triton_version():
+    try:
+        import triton
+        from packaging.version import Version
+        return Version(triton.__version__)
+    except ImportError:
+        return None
+
+
+# Mamba3's SISO forward kernel contains a tl.dot with N = 1, which Triton <= 3.4 rejects
+# ("M >= 16, N >= 16 and K >= 16") on every GPU. Upstream mamba_ssm requires triton >= 3.5.0.
+_tv = _triton_version()
+requires_mamba3_triton = pytest.mark.skipif(
+    _tv is None or _tv.release < (3, 5),
+    reason=f"Mamba3 Triton kernels need triton >= 3.5.0 (found {_tv}); torch 2.8 pins triton 3.4",
+)

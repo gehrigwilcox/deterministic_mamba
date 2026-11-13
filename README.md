@@ -13,10 +13,20 @@ import torch
 from mamba_ssm.models.mixer_seq_simple import MixerModel
 
 torch.use_deterministic_algorithms(True)   # any time, including after the import
-# export CUBLAS_WORKSPACE_CONFIG=:4096:8   # needed by PyTorch's own GEMMs in this mode
 
 model = MixerModel(..., ssm_cfg={"layer": "Mamba1"})   # or "Mamba2", or "Mamba3"
 ```
+
+> **You must also set `CUBLAS_WORKSPACE_CONFIG=:4096:8` before the process starts.**
+> Deterministic mode makes PyTorch's own matrix multiplies (all the linear layers) refuse to run
+> without it. cuBLAS reads the variable once, when CUDA initializes, so setting it later from
+> Python (e.g. `os.environ[...]` after the first CUDA call) does nothing. If you miss it, the
+> failure is a `RuntimeError` from deep inside a GEMM that names the variable but doesn't say it
+> had to be set at startup. Put it in the launch command or job script:
+>
+> ```bash
+> CUBLAS_WORKSPACE_CONFIG=:4096:8 python train.py
+> ```
 
 Other ways to switch: `mamba_ssm.utils.determinism.set_deterministic_mode(True|False|None)`
 (process override), or `MAMBA_DETERMINISTIC=1` (and `CAUSAL_CONV1D_DETERMINISTIC=1` for the
@@ -24,17 +34,50 @@ conv). `torch.use_deterministic_algorithms` controls both packages at once.
 
 Pinned versions (`versions.env`): **mamba_ssm v2.3.2.post1** and **causal-conv1d v1.7.0**.
 
+## Prerequisites
+
+These come from upstream mamba_ssm 2.3.2.post1 and apply to the stock package as well:
+
+* **torch ≥ 2.8.0 to `import mamba_ssm` at all, whichever Mamba layer you use.** `mamba_ssm`
+  imports its Mamba3 module at package import. That pulls in its hard dependency
+  `quack-kernels`, which uses `torch.float4_e2m1fn_x2`, a dtype added in torch 2.8. On older
+  torch the import fails with an `AttributeError`, even for plain Mamba1.
+* **Triton ≥ 3.5.0 (in practice torch ≥ 2.9) for Mamba3.** Triton ≤ 3.4 requires every `tl.dot`
+  dimension to be ≥ 16. Mamba3's SISO forward kernel computes a row sum as a dot with an N = 1
+  column of ones, so on Triton 3.4 (which torch 2.8 pins) Mamba3 fails to compile with
+  `Input shapes should have M >= 16, N >= 16 and K >= 16`. This happens on every GPU
+  architecture. Mamba1 and Mamba2 work on Triton 3.4. Upstream declares `triton>=3.5.0`, but
+  `build.sh` installs with `--no-deps` (below), so it checks this itself and warns.
+* **A CUDA toolkit (`nvcc`) whose major *and minor* version match `torch.version.cuda`.**
+  Matching only the major version isn't enough. For example, nvcc 12.9 against a torch built for
+  CUDA 12.1 fails with libcu++ host/device qualifier errors in `<cuda/std/__cmath/traits.h>`.
+  `build.sh` refuses a mismatch unless you set `ALLOW_CUDA_MISMATCH=1`.
+
 ## Install
 
 ```bash
-# Use the Python env you train in; nvcc must match torch's CUDA major version.
+# In the Python env you train in, with CUDA_HOME pointing at the matching toolkit:
 PIP="python -m pip" CUDA_ARCHS="80;90" scripts/build.sh
+scripts/build.sh --check     # just the environment checks
 ```
 
-`build.sh` clones the pinned tags and applies `patches/` with `git am`. It then pip-installs
-`causal_conv1d` and `mamba_ssm` from source. `CUDA_ARCHS` is optional and only cuts compile
-time; without it you get upstream's full architecture list. `--patch-only` stops after patching
-(the sources are left in `build/`).
+`build.sh` checks the prerequisites above, clones the pinned tags and applies `patches/` with
+`git am`. It then builds and installs `causal_conv1d` and `mamba_ssm` from source and runs a
+smoke import. `CUDA_ARCHS` is optional and only cuts compile time; without it you get upstream's
+full architecture list. `--patch-only` stops after patching (the sources are left in `build/`).
+
+The packages are installed with `pip install --force-reinstall --no-deps --no-cache-dir`:
+
+* `--force-reinstall`: the version string doesn't change between rebuilds, so plain
+  `pip install` can skip the build. It then leaves a `.so` compiled against a previous torch,
+  which fails at import after a torch upgrade (`undefined symbol: ...c10_cuda_check_implementation...`).
+* `--no-deps`: without it, `--force-reinstall` also reinstalls torch and the other dependencies
+  from PyPI, replacing your pinned versions.
+* `--no-cache-dir`: never reuses a wheel cached from a build against another torch.
+
+Because dependencies aren't installed, `build.sh` lists any missing runtime dependencies
+(`einops`, `transformers`, `tilelang==0.1.8`, `apache-tvm-ffi<=0.1.9`, `quack-kernels>=0.3.4`,
+...) for you to install. Rerun `build.sh` after every torch upgrade.
 
 ## What upstream already covers and what the patches add
 

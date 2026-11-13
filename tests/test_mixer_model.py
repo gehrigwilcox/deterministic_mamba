@@ -9,9 +9,10 @@ import textwrap
 import pytest
 import torch
 
-from conftest import deterministic, digest
+from conftest import deterministic, digest, requires_mamba3_triton
 
 DEV = "cuda"
+LAYERS = ["Mamba1", "Mamba2", pytest.param("Mamba3", marks=requires_mamba3_triton)]
 LAYER_CFG = {
     "Mamba1": {"layer": "Mamba1"},
     "Mamba2": {"layer": "Mamba2", "d_state": 64, "headdim": 32, "chunk_size": 64},
@@ -38,13 +39,13 @@ def train(layer, steps=3, seqlen=200, seed=0):
     return [p.detach() for p in model.parameters()]
 
 
-@pytest.mark.parametrize("layer", list(LAYER_CFG))
+@pytest.mark.parametrize("layer", LAYERS)
 def test_training_bitwise_reproducible_in_process(layer):
     with deterministic(True):
         assert digest(train(layer)) == digest(train(layer))
 
 
-@pytest.mark.parametrize("layer", list(LAYER_CFG))
+@pytest.mark.parametrize("layer", LAYERS)
 def test_training_bitwise_reproducible_across_processes_toggled_after_import(layer):
     script = textwrap.dedent(f"""
         import sys; sys.path.insert(0, {os.path.dirname(__file__)!r})
