@@ -1,0 +1,15 @@
+--- Mamba1
+  stock#1: loss 4.325 -> 1.4462 (mean of last 20 steps 1.4355)
+  stock#2          final 1.4462 (last-20 mean 1.4355)  max|dloss| 2.38e-07  first differs at step 1  max rel weight diff 3.8e-04
+  patched-default  final 1.4462 (last-20 mean 1.4355)  max|dloss| 4.77e-07  first differs at step 1  max rel weight diff 5.4e-04
+  patched-det      final 1.4462 (last-20 mean 1.4355)  max|dloss| 2.38e-07  first differs at step 2  max rel weight diff 2.9e-04
+--- Mamba2
+  stock#1: loss 4.294 -> 1.4479 (mean of last 20 steps 1.4355)
+  stock#2          final 1.4479 (last-20 mean 1.4355)  max|dloss| 2.38e-07  first differs at step 2  max rel weight diff 2.7e-04
+  patched-default  final 1.4479 (last-20 mean 1.4355)  max|dloss| 2.38e-07  first differs at step 2  max rel weight diff 1.4e-04
+  patched-det      final 1.4479 (last-20 mean 1.4355)  max|dloss| 2.38e-07  first differs at step 5  max rel weight diff 3.2e-04
+--- Mamba3
+  stock#1: loss 4.359 -> 1.4357 (mean of last 20 steps 1.4199)
+  stock#2          final 1.4354 (last-20 mean 1.4199)  max|dloss| 6.02e-04  first differs at step 0  max rel weight diff 4.6e-02
+  patched-default  final 1.4359 (last-20 mean 1.4197)  max|dloss| 1.05e-03  first differs at step 0  max rel weight diff 1.6e-01
+  patched-det      final 1.4355 (last-20 mean 1.4195)  max|dloss| 8.76e-04  first differs at step 0  max rel weight diff 1.1e-01

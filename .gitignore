@@ -5,3 +5,4 @@ __pycache__/
 *.so
 .pytest_cache/
 work/
+.env-stock/

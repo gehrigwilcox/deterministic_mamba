@@ -77,6 +77,69 @@ choice on disk, which is reproducible as long as every run shares that cache.
 
 Reproducibility holds for a given GPU model and software stack (driver, CUDA, torch, triton).
 
+## Equivalence with upstream
+
+Two questions: does the patched **default** mode behave exactly like stock upstream, and does
+**deterministic** mode change results beyond floating-point rounding? Both were measured against
+an unpatched build of mamba_ssm 2.3.2.post1 + causal-conv1d 1.7.0. Setup: GTX 1660 SUPER, torch
+2.9.1, Triton 3.5.1, fp32. Each run is a separate process, and determinism is switched on after
+import. Harness and raw reports: [`tests/equivalence/`](tests/equivalence/).
+
+**1. Patched default mode computes exactly what stock computes.** Two things vary run to run even
+in stock: order-dependent atomics, and autotuning, which picks configs by timing in each process.
+That makes "stock vs patched" noisy unless both are controlled. So every autotuned Triton kernel
+(43) was pinned to the same config in both builds, and the module forward/backward plus a 60-step
+`MixerModel` training run were compared tensor by tensor
+([`pinned_report.txt`](tests/equivalence/results/pinned_report.txt)):
+
+| | tensors | bit-identical, stock vs stock | bit-identical, stock vs patched default | stock-stable tensors where patched differs |
+|---|---|---|---|---|
+| Mamba3 | 49 | 49 | **49** (identical 60-step loss curve and weights) | none |
+| Mamba2 | 49 | 12 | 14 | none |
+| Mamba1 | 54 | 3 | 3 | none |
+
+Mamba3's default training path has no order-dependent atomics, so it is fully bit-identical to
+stock. For Mamba1 and Mamba2, every tensor that stock reproduces exactly, the patched build
+reproduces exactly too. The rest are the atomic gradients and the training state they feed, and
+those vary in stock itself. The patched differences there (max rel 6.9e-4 Mamba1, 2.8e-6 Mamba2)
+are no larger than stock-vs-stock (8.2e-4 and 3.1e-6).
+
+The one intended change is the causal-conv1d boundary fix. At seqlen 2049, stock's `dx` is off by
+36% of its max at the chunk boundary, `dweight` by 2.5% and `dbias` by 1.6%; the patched results
+match the `F.conv1d` reference. At other lengths conv outputs are unchanged.
+
+**2. Deterministic mode only changes rounding.** Kernel and module outputs and gradients, compared
+to stock ([`kernel_report.txt`](tests/equivalence/results/kernel_report.txt)), max relative
+difference:
+
+| | deterministic vs stock | stock vs stock (its own run-to-run spread) |
+|---|---|---|
+| Mamba1 scan / `mamba_inner_fn` / module (fp32) | ≤ 3.2e-7 | ≤ 3.0e-7 |
+| Mamba2 SSD kernel (fp32) / module | ≤ 2.2e-6 / ≤ 7e-7 | ≤ 2.4e-7 |
+| Mamba3 SISO kernel / module | ≤ 1.5e-5, except atomic `dK` 3.4e-3 / ≤ 8.6e-5 | 0, except atomic `dK` 6.8e-3 / 0 |
+
+Mamba2 and Mamba3 differ more than Mamba1 because deterministic mode runs fixed kernel configs,
+which use a different reduction order. Mamba3's kernels also use fast sin/cos/tanh
+approximations. Against a float64 reference, deterministic mode is as accurate as default (see
+`tests/test_mamba2_mamba3.py`).
+
+300-step `MixerModel` training on a learnable synthetic language (loss 4.3 → 1.44), with autotuning
+left on as a user would run it ([`curve_report.txt`](tests/equivalence/results/curve_report.txt)).
+The table shows the max loss gap at any step vs stock run 1:
+
+| | stock run 2 | patched default | patched deterministic | final loss (all runs) |
+|---|---|---|---|---|
+| Mamba1 | 2.4e-7 | 4.8e-7 | 2.4e-7 | 1.4462 |
+| Mamba2 | 2.4e-7 | 2.4e-7 | 2.4e-7 | 1.4479 |
+| Mamba3 | 6.0e-4 | 1.0e-3 | 8.8e-4 | 1.4354 – 1.4359 |
+
+Stock Mamba3 already diverges from itself at step 0, because autotune picks different forward
+configs in each process. The patched runs' larger gap traces to the same cause: section 1 shows
+that with configs pinned, patched default matches stock bit for bit.
+
+Rerun: `tests/equivalence/run_all.sh STOCK_PY PATCHED_PY OUTDIR` (kernel report + training
+curves), then `pinned_compare.py` for the pinned-config test (see the script headers).
+
 ## Tests (`tests/`, run against the installed patched packages)
 
 ```bash
@@ -119,6 +182,7 @@ scripts/build.sh          fetch + patch + install
 scripts/export_patches.sh regenerate patches/ from work/
 scripts/dev/              edit scripts that produced the patches; limit_archs.py (build helper)
 tests/                    determinism + correctness tests
+tests/equivalence/        stock-vs-patched equivalence harness + results/
 ```
 
 The git history also holds the earlier standalone fork for mamba_ssm 2.2.4 (Mamba1 only).

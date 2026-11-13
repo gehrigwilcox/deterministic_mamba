@@ -1,0 +1,21 @@
+== Mamba1: 54 tensors (module fwd/bwd outputs + 60-step training losses & weights)
+   bit-identical stockA vs stockB    : 3/54
+   bit-identical patchedA vs patchedB: 3/54
+   bit-identical stockA vs patchedA  : 3/54
+   stock-stable tensors where patched differs: none
+   max rel diff stockB vs stockA 8.2e-04 | patchedA vs stockA 6.9e-04
+   training loss curves identical: stockA==patchedA False, max|dloss| stock-vs-stock 2.4e-07, stock-vs-patched 2.4e-07
+== Mamba2: 49 tensors (module fwd/bwd outputs + 60-step training losses & weights)
+   bit-identical stockA vs stockB    : 12/49
+   bit-identical patchedA vs patchedB: 14/49
+   bit-identical stockA vs patchedA  : 14/49
+   stock-stable tensors where patched differs: none
+   max rel diff stockB vs stockA 3.1e-06 | patchedA vs stockA 2.8e-06
+   training loss curves identical: stockA==patchedA False, max|dloss| stock-vs-stock 2.4e-07, stock-vs-patched 2.4e-07
+== Mamba3: 49 tensors (module fwd/bwd outputs + 60-step training losses & weights)
+   bit-identical stockA vs stockB    : 49/49
+   bit-identical patchedA vs patchedB: 49/49
+   bit-identical stockA vs patchedA  : 49/49
+   stock-stable tensors where patched differs: none
+   max rel diff stockB vs stockA 0.0e+00 | patchedA vs stockA 0.0e+00
+   training loss curves identical: stockA==patchedA True, max|dloss| stock-vs-stock 0.0e+00, stock-vs-patched 0.0e+00
