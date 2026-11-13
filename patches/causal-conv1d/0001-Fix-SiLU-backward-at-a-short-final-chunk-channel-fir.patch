@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gehrig Wilcox <lougehrig10@gmail.com>
+Date: Thu, 12 Nov 2026 18:52:52 -0600
+Subject: [PATCH] Fix SiLU backward at a short final chunk (channel-first)
+
+When seqlen % (kNThreads * kNElts) < kNElts and seqlen % kNElts != 0 (e.g.
+seqlen = 2049), thread 0 bounds-checked the current chunk's index while
+loading the tail of the previous chunk, leaving part of it zero. The SiLU
+input recomputed at the chunk boundary was then wrong, and so were dx,
+dweight and dbias there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ csrc/causal_conv1d_bwd.cu | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/csrc/causal_conv1d_bwd.cu b/csrc/causal_conv1d_bwd.cu
+index 917fea3..b0b6ca0 100644
+--- a/csrc/causal_conv1d_bwd.cu
++++ b/csrc/causal_conv1d_bwd.cu
+@@ -147,7 +147,12 @@ void causal_conv1d_bwd_kernel(ConvParamsBwd params) {
+                 } else {
+                     #pragma unroll
+                     for (int i = 0; i < kNElts; ++i) {
+-                        if (chunk * kChunkSize + i < params.seqlen) { x_vals_load[i] = x[-kNElts + i]; }
++                        // These are the last kNElts elements of the *previous* chunk, which are always
++                        // in range when chunk > 0. Bounds-checking the current chunk's index instead
++                        // left them zero when the final chunk has < kNElts valid elements (e.g.
++                        // seqlen = 2049), corrupting the recomputed SiLU input and therefore
++                        // dx / dweight / dbias at that chunk boundary.
++                        if (chunk * kChunkSize - kNElts + i < params.seqlen) { x_vals_load[i] = x[-kNElts + i]; }
+                     }
+                 }
+             }

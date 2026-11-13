@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gehrig Wilcox <lougehrig10@gmail.com>
+Date: Thu, 12 Nov 2026 19:25:18 -0600
+Subject: [PATCH 4/4] MixerModel: accept ssm_cfg layer="Mamba3"
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mamba_ssm/models/mixer_seq_simple.py | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/mamba_ssm/models/mixer_seq_simple.py b/mamba_ssm/models/mixer_seq_simple.py
+index fae2257..c1bba27 100644
+--- a/mamba_ssm/models/mixer_seq_simple.py
++++ b/mamba_ssm/models/mixer_seq_simple.py
+@@ -14,6 +14,7 @@ import torch.nn as nn
+ from mamba_ssm.models.config_mamba import MambaConfig
+ from mamba_ssm.modules.mamba_simple import Mamba
+ from mamba_ssm.modules.mamba2 import Mamba2
++from mamba_ssm.modules.mamba3 import Mamba3
+ from mamba_ssm.modules.mha import MHA
+ from mamba_ssm.modules.mlp import GatedMLP
+ from mamba_ssm.modules.block import Block
+@@ -51,10 +52,11 @@ def create_block(
+         # Create a copy of the config to modify
+         ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
+         ssm_layer = ssm_cfg.pop("layer", "Mamba1")
+-        if ssm_layer not in ["Mamba1", "Mamba2"]:
+-            raise ValueError(f"Invalid ssm_layer: {ssm_layer}, only support Mamba1 and Mamba2")
++        layer_classes = {"Mamba1": Mamba, "Mamba2": Mamba2, "Mamba3": Mamba3}
++        if ssm_layer not in layer_classes:
++            raise ValueError(f"Invalid ssm_layer: {ssm_layer}, only support Mamba1, Mamba2 and Mamba3")
+         mixer_cls = partial(
+-            Mamba2 if ssm_layer == "Mamba2" else Mamba,
++            layer_classes[ssm_layer],
+             layer_idx=layer_idx,
+             **ssm_cfg,
+             **factory_kwargs

@@ -1,0 +1,917 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gehrig Wilcox <lougehrig10@gmail.com>
+Date: Thu, 12 Nov 2026 19:25:18 -0600
+Subject: [PATCH 2/4] Decide autotune config set at launch time, not import
+ time
+
+autotune_configs() is evaluated when a kernel is decorated, i.e. at import.
+torch.use_deterministic_algorithms(True) (or set_deterministic_mode) called
+after `import mamba_ssm` therefore left full autotuning on, and the chosen
+configs - which change reduction order - could differ between processes.
+
+Replace @triton.autotune(configs=autotune_configs([...])) with
+@autotune(configs=[...]): a thin wrapper holding a fully-autotuned kernel and
+a lazily-built deterministic one (deterministic_configs(): cached autotuning
+with TRITON_CACHE_AUTOTUNING=1, the TRITON_AUTOTUNE_BLOCK_SIZE_* filter, or
+the cheapest config). use_deterministic_mode() is checked on every launch.
+.configs returns the full list (workspace sizing stays valid in both modes);
+.best_config returns the config of the most recent launch.
+
+Applies to every autotuned kernel in mamba_ssm, including the Mamba3 and
+Mamba3-MIMO Triton kernels, which previously had no deterministic configs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mamba_ssm/ops/triton/k_activations.py         | 14 ++--
+ mamba_ssm/ops/triton/layer_norm.py            | 10 +--
+ mamba_ssm/ops/triton/mamba3/angle_dt.py       |  6 +-
+ .../ops/triton/mamba3/mamba3_mimo_utils.py    | 18 ++---
+ .../ops/triton/mamba3/mamba3_siso_bwd.py      | 10 +--
+ .../ops/triton/mamba3/mamba3_siso_fwd.py      |  4 +-
+ .../ops/triton/mamba3/mamba3_siso_step.py     |  4 +-
+ mamba_ssm/ops/triton/ssd_bmm.py               | 14 ++--
+ mamba_ssm/ops/triton/ssd_chunk_scan.py        | 68 +++++++++---------
+ mamba_ssm/ops/triton/ssd_chunk_state.py       | 44 ++++++------
+ mamba_ssm/ops/triton/ssd_combined.py          |  8 +--
+ mamba_ssm/ops/triton/ssd_state_passing.py     | 14 ++--
+ mamba_ssm/utils/determinism.py                | 69 +++++++++++++++++--
+ 13 files changed, 177 insertions(+), 106 deletions(-)
+
+diff --git a/mamba_ssm/ops/triton/k_activations.py b/mamba_ssm/ops/triton/k_activations.py
+index 6ac4117..91c4099 100644
+--- a/mamba_ssm/ops/triton/k_activations.py
++++ b/mamba_ssm/ops/triton/k_activations.py
+@@ -5,18 +5,18 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from mamba_ssm.utils.determinism import autotune_configs
++from mamba_ssm.utils.determinism import autotune
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_N': 32}),
+         triton.Config({'BLOCK_N': 64}),
+         triton.Config({'BLOCK_N': 128}),
+         triton.Config({'BLOCK_N': 256}),
+         triton.Config({'BLOCK_N': 512}),
+         triton.Config({'BLOCK_N': 1024}),
+-    ]),
++    ],
+     key=['ncols'],
+ )
+ @triton.jit
+@@ -62,15 +62,15 @@ def _swiglu_fwd(xy, out=None):
+     return out.reshape(*batch_shape, out.shape[-1])
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_N': 32}),
+         triton.Config({'BLOCK_N': 64}),
+         triton.Config({'BLOCK_N': 128}),
+         triton.Config({'BLOCK_N': 256}),
+         triton.Config({'BLOCK_N': 512}),
+         triton.Config({'BLOCK_N': 1024}),
+-    ]),
++    ],
+     key=['ncols'],
+ )
+ @triton.heuristics({"RECOMPUTE_OUTPUT": lambda args: args["OUT"] is not None})
+diff --git a/mamba_ssm/ops/triton/layer_norm.py b/mamba_ssm/ops/triton/layer_norm.py
+index 3e61f29..900bff3 100755
+--- a/mamba_ssm/ops/triton/layer_norm.py
++++ b/mamba_ssm/ops/triton/layer_norm.py
+@@ -16,7 +16,7 @@ from mamba_ssm.utils.torch import custom_bwd, custom_fwd
+ import triton
+ import triton.language as tl
+ 
+-from mamba_ssm.utils.determinism import autotune_configs
++from mamba_ssm.utils.determinism import autotune
+ 
+ 
+ def layer_norm_ref(
+@@ -168,8 +168,8 @@ configs_autotune = [
+ 
+ pruned_configs_autotune = config_prune(configs_autotune)
+ 
+-@triton.autotune(
+-    configs=autotune_configs(pruned_configs_autotune),
++@autotune(
++    configs=pruned_configs_autotune,
+     key=["N", "HAS_RESIDUAL", "STORE_RESIDUAL_OUT", "IS_RMS_NORM", "HAS_BIAS"],
+ )
+ # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
+@@ -420,8 +420,8 @@ def _layer_norm_fwd(
+     )
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs(pruned_configs_autotune),
++@autotune(
++    configs=pruned_configs_autotune,
+     key=["N", "HAS_DRESIDUAL", "STORE_DRESIDUAL", "IS_RMS_NORM", "HAS_BIAS", "HAS_DROPOUT"],
+ )
+ # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
+diff --git a/mamba_ssm/ops/triton/mamba3/angle_dt.py b/mamba_ssm/ops/triton/mamba3/angle_dt.py
+index 5363efa..167c647 100644
+--- a/mamba_ssm/ops/triton/mamba3/angle_dt.py
++++ b/mamba_ssm/ops/triton/mamba3/angle_dt.py
+@@ -5,6 +5,8 @@ from torch import Tensor
+ 
+ import triton
+ import triton.language as tl
++
++from mamba_ssm.utils.determinism import autotune
+ from mamba_ssm.ops.triton.mamba3.utils import tanh_approx, sech2_approx
+ 
+ 
+@@ -12,7 +14,7 @@ from mamba_ssm.ops.triton.mamba3.utils import tanh_approx, sech2_approx
+ # Forward kernel
+ # -----------------------------------------------------------------------------
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [1, 2, 3]
+@@ -220,7 +222,7 @@ def angle_dt_fwd(
+ # Backward kernel
+ # -----------------------------------------------------------------------------
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [1, 2, 3]
+diff --git a/mamba_ssm/ops/triton/mamba3/mamba3_mimo_utils.py b/mamba_ssm/ops/triton/mamba3/mamba3_mimo_utils.py
+index 5de93ae..598f7e7 100644
+--- a/mamba_ssm/ops/triton/mamba3/mamba3_mimo_utils.py
++++ b/mamba_ssm/ops/triton/mamba3/mamba3_mimo_utils.py
+@@ -48,6 +48,8 @@ position in the packed tensor; see _build_varlen_chunk_mapping for details.
+ import torch
+ import triton
+ import triton.language as tl
++
++from mamba_ssm.utils.determinism import autotune
+ import math
+ from typing import Optional, Tuple
+ 
+@@ -59,7 +61,7 @@ from typing import Optional, Tuple
+ #   bwd_dadt_cumsum_fused_kernel_varlen – varlen (see bottom of file)
+ # ============================================================================
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [1, 2, 3]
+@@ -134,7 +136,7 @@ def bwd_dadt_cumsum_fused_kernel(
+ #   bwd_segsum_dadt_kernel_varlen – varlen (see bottom of file)
+ # ============================================================================
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [2, 3]
+@@ -223,7 +225,7 @@ def bwd_segsum_dadt_kernel(
+ #   bwd_dtrap_ddt_kernel_varlen – varlen (see bottom of file)
+ # ============================================================================
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [2, 3]
+@@ -357,7 +359,7 @@ def bwd_dtrap_ddt_kernel(
+ #   dacs_segsum_kernel_varlen – varlen (this kernel)
+ # ============================================================================
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [2, 3]
+@@ -441,7 +443,7 @@ def dacs_segsum_kernel_varlen(
+ # Kernel group 4 (dense): compute da_cs, da_cs_rev, and segsum from da
+ # ============================================================================
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [2, 3]
+@@ -1007,7 +1009,7 @@ def compute_dtrap_ddt_varlen_ref(
+ # Kernel groups 1-3 varlen implementations.  Group 4 varlen kernel is above.
+ # ============================================================================
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [1, 2, 3]
+@@ -1076,7 +1078,7 @@ def bwd_dadt_cumsum_fused_kernel_varlen(
+     tl.store(ddt_out_ptr + base + offs_seq * stride_seq, ddt_total, mask=mask)
+ 
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [2, 3]
+@@ -1148,7 +1150,7 @@ def bwd_segsum_dadt_kernel_varlen(
+     tl.store(ddt_ptrs, ddt_chunk, mask=mask_seq)
+ 
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [2, 3]
+diff --git a/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py b/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py
+index 4045f2c..74ae73d 100644
+--- a/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py
++++ b/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py
+@@ -13,13 +13,15 @@ from einops import rearrange, repeat
+ 
+ import triton
+ import triton.language as tl
++
++from mamba_ssm.utils.determinism import autotune
+ from mamba_ssm.ops.triton.mamba3.utils import cos_approx, sin_approx, sigmoid_approx
+ 
+ # =============================================================================
+ # dZ Kernel
+ # =============================================================================
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({"CHUNK_SIZE": cs}, num_stages=s, num_warps=w, maxnreg=r)
+         for cs in [32, 64]
+@@ -191,7 +193,7 @@ def compute_dzdo(
+ # dQKV Kernel
+ # =============================================================================
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w, maxnreg=r)
+         for s in [1, 2, 3]
+@@ -809,7 +811,7 @@ def compute_dqkv(
+ # =============================================================================
+ 
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w, maxnreg=r)
+         for s in [1, 2, 3]
+@@ -1416,7 +1418,7 @@ def apply_dk_state_post(
+ # =============================================================================
+ # dDT, dTrap, and dInput States Kernel
+ # =============================================================================
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({"CHUNK_SIZE": cs}, num_stages=s, num_warps=w, maxnreg=r)
+         for cs in [64, 128, 256]
+diff --git a/mamba_ssm/ops/triton/mamba3/mamba3_siso_fwd.py b/mamba_ssm/ops/triton/mamba3/mamba3_siso_fwd.py
+index f296cc3..b8307ca 100644
+--- a/mamba_ssm/ops/triton/mamba3/mamba3_siso_fwd.py
++++ b/mamba_ssm/ops/triton/mamba3/mamba3_siso_fwd.py
+@@ -13,9 +13,11 @@ from einops import rearrange, repeat
+ 
+ import triton
+ import triton.language as tl
++
++from mamba_ssm.utils.determinism import autotune
+ from mamba_ssm.ops.triton.mamba3.utils import cos_approx, sin_approx, tanh_approx, silu, sigmoid_approx
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w, maxnreg=r)
+         for s in [1, 2, 3]
+diff --git a/mamba_ssm/ops/triton/mamba3/mamba3_siso_step.py b/mamba_ssm/ops/triton/mamba3/mamba3_siso_step.py
+index 2fbde0a..2fb186b 100644
+--- a/mamba_ssm/ops/triton/mamba3/mamba3_siso_step.py
++++ b/mamba_ssm/ops/triton/mamba3/mamba3_siso_step.py
+@@ -11,10 +11,12 @@ import torch
+ 
+ import triton
+ import triton.language as tl
++
++from mamba_ssm.utils.determinism import autotune
+ from mamba_ssm.ops.triton.mamba3.utils import cos_approx, sin_approx, silu, tanh_approx, sigmoid_approx
+ 
+ 
+-@triton.autotune(
++@autotune(
+     configs=[
+         triton.Config({}, num_stages=s, num_warps=w)
+         for s in [1, 2, 3]
+diff --git a/mamba_ssm/ops/triton/ssd_bmm.py b/mamba_ssm/ops/triton/ssd_bmm.py
+index 20f619f..c24b130 100644
+--- a/mamba_ssm/ops/triton/ssd_bmm.py
++++ b/mamba_ssm/ops/triton/ssd_bmm.py
+@@ -12,15 +12,15 @@ import triton.language as tl
+ 
+ from einops import rearrange, repeat
+ 
+-from mamba_ssm.utils.determinism import autotune_configs
++from mamba_ssm.utils.determinism import autotune
+ 
+ 
+ def init_to_zero(names):
+     return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+@@ -30,7 +30,7 @@ def init_to_zero(names):
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=2),
+-    ]),
++    ],
+     key=['chunk_size', 'K', 'IS_CAUSAL'],
+ )
+ @triton.jit
+@@ -93,8 +93,8 @@ def _bmm_chunk_fwd_kernel(
+     tl.store(out_ptrs, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_CS': 64}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_CS': 32}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_CS': 32}, num_stages=4, num_warps=4),
+@@ -104,7 +104,7 @@ def _bmm_chunk_fwd_kernel(
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_CS': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_CS': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_CS': 32}, num_stages=4, num_warps=2),
+-    ]),
++    ],
+     key=['chunk_size', 'K'],
+ )
+ @triton.jit
+diff --git a/mamba_ssm/ops/triton/ssd_chunk_scan.py b/mamba_ssm/ops/triton/ssd_chunk_scan.py
+index 7279eda..b3a8530 100644
+--- a/mamba_ssm/ops/triton/ssd_chunk_scan.py
++++ b/mamba_ssm/ops/triton/ssd_chunk_scan.py
+@@ -19,7 +19,7 @@ from mamba_ssm.utils.determinism import (
+     alloc_tile_workspace,
+     finalize_tile_workspace,
+     use_deterministic_mode,
+-    autotune_configs,
++    autotune,
+ )
+ 
+ TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
+@@ -29,8 +29,8 @@ def init_to_zero(names):
+     return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+@@ -42,7 +42,7 @@ def init_to_zero(names):
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=2),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim', 'dstate', 'IS_CAUSAL'],
+ )
+ @triton.jit
+@@ -180,15 +180,15 @@ def _chunk_scan_fwd_kernel(
+     tl.store(out_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim))
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         # triton.Config({'BLOCK_SIZE_N': 256}, num_stages=4, num_warps=4),
+         # triton.Config({'BLOCK_SIZE_N': 128}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_N': 64}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_N': 32}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_N': 64}, num_stages=4, num_warps=8),
+         triton.Config({'BLOCK_SIZE_N': 32}, num_stages=4, num_warps=8),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim', 'dstate'],
+ )
+ @triton.jit
+@@ -336,13 +336,13 @@ def _chunk_scan_fwd_kernel_wip(
+         out_ptrs += BLOCK_SIZE_M * stride_out_seqlen
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 32}),
+         triton.Config({'BLOCK_SIZE_M': 64}),
+         triton.Config({'BLOCK_SIZE_M': 128}),
+         triton.Config({'BLOCK_SIZE_M': 256}),
+-    ]),
++    ],
+     key=["chunk_size", "hdim"],
+ )
+ @triton.jit
+@@ -431,8 +431,8 @@ def _chunk_scan_bwd_dz_kernel(
+         tl.store(ddA_cumsum_ptr + offs_m * stride_ddA_cs_csize, ddA_cs, mask=offs_m < chunk_size)
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+@@ -442,7 +442,7 @@ def _chunk_scan_bwd_dz_kernel(
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=2),
+-    ]),
++    ],
+     key=['hdim', 'dstate', 'chunk_size'],
+ )
+ @triton.jit
+@@ -513,8 +513,8 @@ def _chunk_scan_bwd_dstates_kernel(
+     tl.store(dprev_states_ptrs, out, mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate))
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+@@ -523,7 +523,7 @@ def _chunk_scan_bwd_dstates_kernel(
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+-    ]),
++    ],
+     key=['chunk_size', 'dstate', 'hdim'],
+ )
+ @triton.jit
+@@ -623,8 +623,8 @@ _CHUNK_SCAN_BWD_DC_MIN_BLOCK_N = min(
+ )
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8, pre_hook=init_to_zero(["ddt_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+@@ -634,7 +634,7 @@ _CHUNK_SCAN_BWD_DC_MIN_BLOCK_N = min(
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim'],
+ )
+ @triton.jit
+@@ -749,8 +749,8 @@ _CHUNK_SCAN_BWD_DX_MIN_BLOCK_N = min(
+ 
+ 
+ # Disabling HAS_DDA_CS for now since it's much slower
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
+@@ -765,7 +765,7 @@ _CHUNK_SCAN_BWD_DX_MIN_BLOCK_N = min(
+         # triton.Config({'BLOCK_SIZE_M': 32}, num_stages=4, num_warps=8),
+         # triton.Config({'BLOCK_SIZE_M': 64}, num_stages=4, num_warps=8),
+         # triton.Config({'BLOCK_SIZE_M': 128}, num_stages=4, num_warps=8),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim'],
+ )
+ # @triton.heuristics({"BLOCK_SIZE_N": lambda args: max(triton.next_power_of_2(args["chunk_size"]), 16)})
+@@ -876,13 +876,13 @@ def _chunk_scan_bwd_dcb_kernel(
+ 
+ 
+ # Not numerically stable and should not be used. Leaving here for reference.
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 32}),
+         triton.Config({'BLOCK_SIZE_M': 64}),
+         triton.Config({'BLOCK_SIZE_M': 128}),
+         triton.Config({'BLOCK_SIZE_M': 256}),
+-    ]),
++    ],
+     key=["chunk_size", "hdim"],
+ )
+ @triton.jit
+@@ -954,8 +954,8 @@ def _chunk_scan_bwd_ddAcs_unstable_kernel(
+     tl.store(ddA_cumsum_ptr + offs_m * stride_ddA_cs_csize, ddA_cs, mask=offs_m < chunk_size)
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         # triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=4),
+         # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=4),
+         # triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_K': 32}, num_stages=3, num_warps=4),
+@@ -972,7 +972,7 @@ def _chunk_scan_bwd_ddAcs_unstable_kernel(
+         triton.Config({'BLOCK_SIZE_M': 32}, num_stages=4, num_warps=8),
+         triton.Config({'BLOCK_SIZE_M': 64}, num_stages=4, num_warps=8),
+         triton.Config({'BLOCK_SIZE_M': 128}, num_stages=4, num_warps=8),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim'],
+ )
+ @triton.jit
+@@ -1080,8 +1080,8 @@ def _chunk_scan_bwd_ddAcs_stable_kernel_old(
+     # # tl.store(ddAcs_ptr, 0.0)
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+         # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
+         # triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4),
+@@ -1091,7 +1091,7 @@ def _chunk_scan_bwd_ddAcs_stable_kernel_old(
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim'],
+ )
+ @triton.jit
+@@ -1183,15 +1183,15 @@ def _chunk_scan_bwd_ddAcs_stable_kernel(
+         ddAcs_ptrs += BLOCK_SIZE_N * stride_ddA_cs_csize_n
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+-    ]),
++    ],
+     key=['chunk_size', 'dstate', 'hdim'],
+ )
+ @triton.jit
+diff --git a/mamba_ssm/ops/triton/ssd_chunk_state.py b/mamba_ssm/ops/triton/ssd_chunk_state.py
+index 0487181..a13d05d 100644
+--- a/mamba_ssm/ops/triton/ssd_chunk_state.py
++++ b/mamba_ssm/ops/triton/ssd_chunk_state.py
+@@ -17,15 +17,15 @@ from mamba_ssm.utils.determinism import (
+     alloc_tile_workspace,
+     finalize_tile_workspace,
+     use_deterministic_mode,
+-    autotune_configs,
++    autotune,
+ )
+ 
+ 
+ def init_to_zero(names):
+     return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_H': 1}),
+         triton.Config({'BLOCK_SIZE_H': 2}),
+         triton.Config({'BLOCK_SIZE_H': 4}),
+@@ -33,7 +33,7 @@ def init_to_zero(names):
+         triton.Config({'BLOCK_SIZE_H': 16}),
+         triton.Config({'BLOCK_SIZE_H': 32}),
+         triton.Config({'BLOCK_SIZE_H': 64}),
+-    ]),
++    ],
+     key=['chunk_size', 'nheads'],
+ )
+ @triton.jit
+@@ -86,8 +86,8 @@ def _chunk_cumsum_fwd_kernel(
+     tl.store(dA_cs_ptrs, dA_cs, mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size))
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_H': 1}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
+         triton.Config({'BLOCK_SIZE_H': 2}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
+         triton.Config({'BLOCK_SIZE_H': 4}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
+@@ -95,7 +95,7 @@ def _chunk_cumsum_fwd_kernel(
+         triton.Config({'BLOCK_SIZE_H': 16}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
+         triton.Config({'BLOCK_SIZE_H': 32}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
+         triton.Config({'BLOCK_SIZE_H': 64}, pre_hook=init_to_zero(["dA_ptr", "ddt_bias_ptr"])),
+-    ]),
++    ],
+     key=['chunk_size', 'nheads'],
+ )
+ @triton.jit
+@@ -174,8 +174,8 @@ def _chunk_cumsum_bwd_kernel(
+             tl.atomic_add(ddt_bias_ptr + offs_h * stride_ddt_bias_head, ddt_bias, mask=offs_h < nheads)
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+@@ -185,7 +185,7 @@ def _chunk_cumsum_bwd_kernel(
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=2),
+-    ]),
++    ],
+     key=['hdim', 'dstate', 'chunk_size'],
+ )
+ @triton.jit
+@@ -268,8 +268,8 @@ def _chunk_state_fwd_kernel(
+     tl.store(states_ptrs, states, mask=c_mask)
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8, pre_hook=init_to_zero(["ddt_ptr", "ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "ddA_cumsum_ptr"])),
+@@ -279,7 +279,7 @@ def _chunk_state_fwd_kernel(
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "ddA_cumsum_ptr"])),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim', 'dstate'],
+ )
+ @triton.jit
+@@ -381,8 +381,8 @@ _CHUNK_STATE_BWD_DX_MIN_BLOCK_N = min(
+ )
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+@@ -391,7 +391,7 @@ _CHUNK_STATE_BWD_DX_MIN_BLOCK_N = min(
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32}, num_stages=3, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+-    ]),
++    ],
+     key=['chunk_size', 'dstate', 'hdim'],
+ )
+ @triton.jit
+@@ -502,8 +502,8 @@ _CHUNK_STATE_BWD_DB_MIN_BLOCK_N = min(
+ )
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         # triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         # triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+@@ -521,7 +521,7 @@ _CHUNK_STATE_BWD_DB_MIN_BLOCK_N = min(
+         triton.Config({'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=8, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=8, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+         triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=8, pre_hook=init_to_zero(["ddA_cumsum_ptr"])),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim', 'dstate'],
+ )
+ @triton.jit
+@@ -622,8 +622,8 @@ _CHUNK_STATE_BWD_DDACS_MIN_BLOCK_N = min(
+ )
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4),
+@@ -633,7 +633,7 @@ _CHUNK_STATE_BWD_DDACS_MIN_BLOCK_N = min(
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=2),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=2),
+-    ]),
++    ],
+     key=['hdim', 'dstate', 'chunk_size'],
+ )
+ @triton.jit
+diff --git a/mamba_ssm/ops/triton/ssd_combined.py b/mamba_ssm/ops/triton/ssd_combined.py
+index 75428a6..a376818 100644
+--- a/mamba_ssm/ops/triton/ssd_combined.py
++++ b/mamba_ssm/ops/triton/ssd_combined.py
+@@ -44,7 +44,7 @@ from mamba_ssm.ops.triton.layernorm_gated import rmsnorm_fn, _layer_norm_fwd, _l
+ from mamba_ssm.ops.triton.k_activations import _swiglu_fwd, _swiglu_bwd
+ from mamba_ssm.utils.determinism import (
+     alloc_tile_workspace,
+-    autotune_configs,
++    autotune,
+     finalize_tile_workspace,
+     use_deterministic_mode,
+ )
+@@ -75,8 +75,8 @@ def ensure_stride(inp):
+     return inp if inp.stride(1) % 8 == 0 else inp.contiguous()
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8, pre_hook=init_to_zero(["ddt_ptr", "dD_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "dD_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "dD_ptr"])),
+@@ -86,7 +86,7 @@ def ensure_stride(inp):
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "dD_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "dD_ptr"])),
+         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr", "dD_ptr"])),
+-    ]),
++    ],
+     key=['chunk_size', 'hdim', 'dstate'],
+ )
+ @triton.jit
+diff --git a/mamba_ssm/ops/triton/ssd_state_passing.py b/mamba_ssm/ops/triton/ssd_state_passing.py
+index d6aa53c..2583b7a 100644
+--- a/mamba_ssm/ops/triton/ssd_state_passing.py
++++ b/mamba_ssm/ops/triton/ssd_state_passing.py
+@@ -12,18 +12,18 @@ import triton.language as tl
+ 
+ from einops import rearrange, repeat
+ 
+-from mamba_ssm.utils.determinism import autotune_configs
++from mamba_ssm.utils.determinism import autotune
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE': 64}),
+         triton.Config({'BLOCK_SIZE': 128}),
+         triton.Config({'BLOCK_SIZE': 256}),
+         triton.Config({'BLOCK_SIZE': 512}),
+         triton.Config({'BLOCK_SIZE': 1024}),
+         triton.Config({'BLOCK_SIZE': 2048}),
+-    ]),
++    ],
+     key=['dim'],
+ )
+ @triton.jit
+@@ -87,15 +87,15 @@ def _state_passing_fwd_kernel(
+         out_ptrs += stride_out_chunk
+ 
+ 
+-@triton.autotune(
+-    configs=autotune_configs([
++@autotune(
++    configs=[
+         triton.Config({'BLOCK_SIZE': 64}),
+         triton.Config({'BLOCK_SIZE': 128}),
+         triton.Config({'BLOCK_SIZE': 256}),
+         triton.Config({'BLOCK_SIZE': 512}),
+         triton.Config({'BLOCK_SIZE': 1024}),
+         triton.Config({'BLOCK_SIZE': 2048}),
+-    ]),
++    ],
+     key=['dim'],
+ )
+ @triton.jit
+diff --git a/mamba_ssm/utils/determinism.py b/mamba_ssm/utils/determinism.py
+index 3e19775..eb2fd9b 100644
+--- a/mamba_ssm/utils/determinism.py
++++ b/mamba_ssm/utils/determinism.py
+@@ -63,13 +63,13 @@ def _filter_configs_by_block_sizes(configs):
+     return matching[:1] if matching else None
+ 
+ 
+-def autotune_configs(configs):
+-    """Select autotune configs for deterministic mode.
+-    
++def deterministic_configs(configs):
++    """The configs to autotune over in deterministic mode (regardless of the current mode).
++
+     Uses cached autotuning (TRITON_CACHE_AUTOTUNING=1) if Triton >= 3.4.0,
+     otherwise auto-selects the cheapest config by block size * stages.
+     """
+-    if not configs or not use_deterministic_mode():
++    if not configs:
+         return configs
+     if TRITON_HAS_CACHE_RESULTS and os.environ.get("TRITON_CACHE_AUTOTUNING") == "1":
+         return configs
+@@ -84,6 +84,67 @@ def autotune_configs(configs):
+     return [min(configs, key=_estimate_config_cost)]
+ 
+ 
++def autotune_configs(configs):
++    """Kept for backward compatibility. Evaluated once, at decoration (import) time, so it only
++    takes effect if deterministic mode is already on when the module is imported. Kernels in
++    mamba_ssm use `autotune` below instead, which decides at every launch."""
++    if not configs or not use_deterministic_mode():
++        return configs
++    return deterministic_configs(configs)
++
++
++class _ModeAwareAutotuner:
++    """A drop-in for a `triton.autotune`-decorated kernel that picks its config set at *launch*
++    time: full autotuning normally, `deterministic_configs(...)` when use_deterministic_mode() is
++    true. So `torch.use_deterministic_algorithms(True)` takes effect even when called after
++    `import mamba_ssm`, and both modes can be used in one process (each keeps its own cache)."""
++
++    def __init__(self, fn, configs, kwargs):
++        self._fn = fn
++        self._all_configs = list(configs)
++        self._kwargs = kwargs
++        self._tuned = triton.autotune(configs=self._all_configs, **kwargs)(fn)
++        self._det = None
++        self._last = self._tuned
++
++    def _select(self):
++        if use_deterministic_mode():
++            if self._det is None:
++                self._det = triton.autotune(configs=deterministic_configs(self._all_configs), **self._kwargs)(self._fn)
++            self._last = self._det
++        else:
++            self._last = self._tuned
++        return self._last
++
++    def __getitem__(self, grid):
++        return self._select()[grid]
++
++    def run(self, *args, **kwargs):
++        return self._select().run(*args, **kwargs)
++
++    @property
++    def configs(self):
++        # The full list, in both modes: callers size workspaces from e.g. min(BLOCK_SIZE_N), and the
++        # deterministic configs are a subset, so sizes derived from the full list stay valid.
++        return self._tuned.configs
++
++    @property
++    def best_config(self):
++        # The config used by the most recent launch (in whichever mode it ran).
++        return self._last.best_config
++
++    def __getattr__(self, name):
++        return getattr(self._tuned, name)
++
++
++def autotune(configs, **kwargs):
++    """Like `triton.autotune`, but deterministic mode is checked at each launch (see
++    _ModeAwareAutotuner). Accepts the same arguments."""
++    def decorator(fn):
++        return _ModeAwareAutotuner(fn, configs, kwargs)
++    return decorator
++
++
+ def alloc_tile_workspace(base_shape, tile_dim, dtype, device, deterministic, *, zero_init=True):
+     """Allocate buffer for deterministic per-program reductions."""
+     if base_shape is None:

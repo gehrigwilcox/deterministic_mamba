@@ -1,138 +1,124 @@
 # deterministic_mamba
 
-A bitwise-deterministic fork of the **Mamba1** kernels and `MixerModel` from
-[`mamba_ssm` 2.2.4](https://github.com/state-spaces/mamba/tree/v2.2.4) (and the
-[`causal-conv1d` 1.5.0.post8](https://github.com/Dao-AILab/causal-conv1d) kernels it uses).
+Patches that make **Mamba1, Mamba2 and Mamba3** training bitwise reproducible, on top of upstream
+[`mamba_ssm`](https://github.com/state-spaces/mamba) and
+[`causal-conv1d`](https://github.com/Dao-AILab/causal-conv1d). The patched packages keep their
+upstream names, so your imports don't change.
 
-Same constructor arguments, same `state_dict` keys, same math. The difference is that two
-training runs with the same seed and data produce **bit-identical** gradients and weights on the
-same GPU and software stack.
-
-```python
-from deterministic_mamba import MixerModel, MambaLMHeadModel, Mamba, enable_full_determinism
-
-enable_full_determinism(seed=0)  # torch.use_deterministic_algorithms + cuBLAS/cuDNN settings
-model = MixerModel(d_model=768, n_layer=24, d_intermediate=0, vocab_size=50277,
-                   rms_norm=True, fused_add_norm=True, residual_in_fp32=True, device="cuda")
-```
-
-To switch an existing codebase, change the imports:
-
-| mamba_ssm 2.2.4 | deterministic_mamba |
-|---|---|
-| `mamba_ssm.models.mixer_seq_simple.MixerModel` | `deterministic_mamba.MixerModel` |
-| `mamba_ssm.models.mixer_seq_simple.MambaLMHeadModel` | `deterministic_mamba.MambaLMHeadModel` |
-| `mamba_ssm.Mamba` | `deterministic_mamba.Mamba` |
-| `mamba_ssm.ops.selective_scan_interface.{selective_scan_fn, mamba_inner_fn}` | `deterministic_mamba.{selective_scan_fn, mamba_inner_fn}` |
-| `causal_conv1d.causal_conv1d_fn` | `deterministic_mamba.causal_conv1d_fn` |
-
-Checkpoints load in both directions without conversion.
-
-## Where the non-determinism came from, and the fix
-
-| Source (upstream 2.2.4) | Why it is non-deterministic | Fix |
-|---|---|---|
-| `selective_scan_bwd_kernel`: `dB`, `dC` (input-dependent B/C) | Every channel of a group `atomicAdd`s into the same `dB[b, g, n, l]`, so float summation order follows block scheduling | Each `(batch, channel)` block **stores** its contribution in its own workspace row. A fixed-order kernel (`csrc/det_reduce.cu`) sums the rows in channel order. |
-| same kernel: `dA`, `dD`, `ddelta_bias`, and constant `dB`/`dC` | `atomicAdd` across the batch | Per-`(batch, channel)` workspace, then a fixed-order sum over the batch |
-| `causal_conv1d_bwd_kernel`: `dweight`, `dbias` | `atomicAdd` across the batch | Per-`(batch, channel)` workspace, then a fixed-order sum over the batch |
-| Triton `layer_norm.py` (RMSNorm / fused add-norm) | `@triton.autotune` over `num_warps` can choose a different config in each process, which changes the `tl.sum` reduction order | Autotune removed; `num_warps` is a fixed function of the block size |
-| Everything else (GEMMs, embedding, loss) | Controlled by PyTorch's global flags | `enable_full_determinism()` sets them, including `CUBLAS_WORKSPACE_CONFIG` |
-
-The sliced workspace (next section) adds rows in the same sequence whatever the slice size, so
-the result is also bitwise independent of the memory budget. A test checks this.
-
-### Memory budget for dB/dC
-
-Writing per-channel `dB`/`dC` contributions needs `batch × channels × d_state × seqlen × 4 B`.
-The host processes channels in slices that fit a budget (default **256 MiB**):
+**Default behavior is upstream's**: the fast kernels, with atomics and autotuning. The
+deterministic kernels are used only when you ask PyTorch for determinism:
 
 ```python
-deterministic_mamba.set_workspace_mb(64)   # or: export DETERMINISTIC_MAMBA_WORKSPACE_MB=64
+import torch
+from mamba_ssm.models.mixer_seq_simple import MixerModel
+
+torch.use_deterministic_algorithms(True)   # any time, including after the import
+# export CUBLAS_WORKSPACE_CONFIG=:4096:8   # needed by PyTorch's own GEMMs in this mode
+
+model = MixerModel(..., ssm_cfg={"layer": "Mamba1"})   # or "Mamba2", or "Mamba3"
 ```
 
-## Measured (GTX 1660 SUPER, torch 2.6, CUDA 12.6)
+Other ways to switch: `mamba_ssm.utils.determinism.set_deterministic_mode(True|False|None)`
+(process override), or `MAMBA_DETERMINISTIC=1` (and `CAUSAL_CONV1D_DETERMINISTIC=1` for the
+conv). `torch.use_deterministic_algorithms` controls both packages at once.
 
-Ten backward calls on identical inputs (batch 4, d_inner 512, L 1500), counting how many
-different results each gradient took:
+Pinned versions (`versions.env`): **mamba_ssm v2.3.2.post1** and **causal-conv1d v1.7.0**.
 
-| | du | ddelta | dz | dA | dB | dC | dD | ddelta_bias |
-|---|---|---|---|---|---|---|---|---|
-| upstream 2.2.4 | 1 | 1 | 1 | **10** | **10** | **10** | **10** | **10** |
-| deterministic_mamba | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
-
-`du`, `ddelta` and `dz` are bitwise equal to upstream. The rest agree with upstream to about 1e-7
-relative in fp32 (only the summation order differs).
-
-Selective-scan backward cost (batch 8, d_inner 1536, L 2048, d_state 16, bf16):
-
-| | time | extra peak memory |
-|---|---|---|
-| upstream 2.2.4 | 28.8 ms | 147 MiB |
-| deterministic, 64 MiB budget | 43.0 ms | 212 MiB |
-| deterministic, 256 MiB budget (default) | 40.7 ms | 404 MiB |
-
-This is the cost of the scan backward only. The rest of a training step (GEMMs, norms,
-conv) runs at the same speed as upstream.
-
-## Bug fix vs upstream causal-conv1d
-
-`causal_conv1d_bwd_kernel` with SiLU (the path `mamba_inner_fn` always uses) bounds-checks the
-wrong index when it loads the last `kNElts` inputs of the previous chunk. If the final chunk holds
-fewer than `kNElts` valid elements (for example seqlen 2049, 4097, …), those inputs are read as 0.
-That gives wrong `dx`, `dweight` and `dbias` at that chunk boundary. The fork fixes the bounds
-check (see `csrc/causal_conv1d/causal_conv1d_bwd.cu`), and `tests/test_causal_conv1d.py` covers
-it.
-
-## Scope / not supported
-
-* **Mamba1 only.** `ssm_cfg={"layer": "Mamba2"}` and attention layers (`attn_layer_idx`) raise
-  `NotImplementedError`. Mamba2's Triton SSD kernels have their own atomics and autotuning and
-  would need a separate fork.
-* Real-valued `A` only (complex selective scan removed). Mamba1 never uses complex `A`.
-* `causal_conv1d_fn`: channel-first layout only; no `seq_idx` / `initial_states` /
-  `final_states` (Mamba2 features).
-* Determinism holds for a fixed GPU model and software stack (driver, CUDA, torch, triton).
-  Different GPUs (different SM counts, for example) can give different, equally valid bits.
-* Inference: `step()` decoding uses the pure-PyTorch conv-state update instead of the
-  `causal_conv1d_update` CUDA kernel. The forward pass is otherwise unchanged.
-
-## Build
-
-The build needs a CUDA toolkit matching your torch build (`nvcc` on `PATH` / `CUDA_HOME`):
+## Install
 
 ```bash
-pip install torch einops triton packaging
-TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0" pip install --no-build-isolation -e .
+# Use the Python env you train in; nvcc must match torch's CUDA major version.
+PIP="python -m pip" CUDA_ARCHS="80;90" scripts/build.sh
 ```
 
-Without `TORCH_CUDA_ARCH_LIST` it builds sm_75/80/86/89/90. For a conda CUDA toolkit, also export
-`CPATH=$CONDA_PREFIX/targets/x86_64-linux/include`.
+`build.sh` clones the pinned tags and applies `patches/` with `git am`. It then pip-installs
+`causal_conv1d` and `mamba_ssm` from source. `CUDA_ARCHS` is optional and only cuts compile
+time; without it you get upstream's full architecture list. `--patch-only` stops after patching
+(the sources are left in `build/`).
 
-## Tests
+## What upstream already covers and what the patches add
+
+Upstream added a deterministic mode in mamba_ssm 2.3 and causal-conv1d 1.7. These patches fill
+the gaps that remain:
+
+| Component | Upstream 2.3.2.post1 / 1.7.0 | This repo |
+|---|---|---|
+| Mamba2 SSD Triton kernels (atomics) | deterministic mode ✔ | unchanged |
+| causal-conv1d backward (atomics, both layouts) | deterministic mode ✔ | **0001**: fixes a SiLU gradient bug (below) |
+| **Mamba1** CUDA selective-scan backward | atomics only, no deterministic mode ✘ | **mamba 0001**: per-block workspace plus fixed-order reduction |
+| Autotuned Triton kernels (config choice changes reduction order) | config set is chosen when the module is *imported*; Mamba3 kernels never restricted ✘ | **mamba 0002**: config set chosen at each *launch*; covers every autotuned kernel, Mamba3 included |
+| **Mamba3** SISO backward, dK state post-step (atomics across GQA heads and batch) | atomics only ✘ | **mamba 0003**: workspace plus fixed-order reduction |
+| `MixerModel` with Mamba3 layers | not accepted ✘ | **mamba 0004**: `ssm_cfg={"layer": "Mamba3"}` |
+
+Notes:
+
+* **mamba 0002 matters even for Mamba2.** Upstream's `autotune_configs()` runs when the module
+  is imported. If you call `torch.use_deterministic_algorithms(True)` after `import mamba_ssm`
+  (the usual order), full autotuning stays on, and different processes can choose different
+  kernel configs. After the patch the choice follows the switch at every launch, and both modes
+  work in one process.
+* **causal-conv1d 0001 is a correctness fix.** It applies in both modes. In the channel-first
+  SiLU backward that Mamba1 uses, thread 0 bounds-checked the wrong index when loading the tail
+  of the previous chunk. When the last chunk has fewer than `kNElts` elements (for example
+  seqlen 2049 or 4097), `dx`, `dweight` and `dbias` came out wrong at that boundary.
+* **Mamba3 MIMO** runs on TileLang kernels, which use fixed configs and no atomics. Its Triton
+  helper kernels are covered by 0002. The other Mamba3 SISO atomics (`dDT` and `dTrap`
+  first-token terms, `dAngles`) touch each address exactly once, so they are already
+  deterministic.
+
+## Cost of deterministic mode
+
+Mamba1 selective-scan backward (GTX 1660 SUPER, batch 8, d_inner 1536, L 2048, d_state 16, bf16):
+about 1.4× the kernel time (28.8 → 40.7 ms), with about 260 MiB of extra workspace at the
+default 256 MiB budget (`MAMBA_DETERMINISTIC_WORKSPACE_MB`). The budget never changes the bits.
+For the Triton kernels, deterministic mode uses one fixed config per kernel instead of the
+autotuned best. `TRITON_CACHE_AUTOTUNING=1` (Triton ≥ 3.4) instead autotunes once and caches the
+choice on disk, which is reproducible as long as every run shares that cache.
+
+Reproducibility holds for a given GPU model and software stack (driver, CUDA, torch, triton).
+
+## Tests (`tests/`, run against the installed patched packages)
 
 ```bash
 pytest tests
 ```
 
-* `test_selective_scan.py`: forward and all gradients against the pure-PyTorch reference
-  (fp32/fp16/bf16, 1 and >1 chunks, variable/constant/grouped B and C, with and without z).
-  Also bitwise repeatability, and bitwise independence from the workspace budget.
-* `test_causal_conv1d.py`: against `F.conv1d`, plus repeatability.
-* `test_mixer_model.py`: AdamW training of a `MixerModel` is bitwise reproducible in-process and
-  across two separate processes. The fast and slow paths agree, the model runs under
-  `torch.use_deterministic_algorithms(True)`, and recurrent decoding matches the parallel scan.
+* `test_mamba1.py`: correctness against the reference in both modes (fp32/fp16/bf16, complex,
+  grouped/variable/constant B and C), bitwise repeatability, all three ways to switch the mode,
+  budget independence, the conv boundary fix, and that default mode is still upstream's atomic
+  path.
+* `test_mamba2_mamba3.py`: Mamba2 SSD and Mamba3 SISO are bitwise repeatable and close to
+  default mode (GQA and final-state gradients included). Also checks that switching after
+  import selects the deterministic configs.
+* `test_mixer_model.py`: `MixerModel` training with Mamba1/2/3 layers gives identical weights
+  in-process and across two separate processes, with determinism switched on *after* import.
+
+Upstream's own `tests/test_determinism.py` (Mamba2) also passes with these patches.
+
+## Moving to a new upstream version
+
+```bash
+git clone --branch <new-tag> https://github.com/state-spaces/mamba work/mamba
+cd work/mamba && git checkout -b deterministic && git am ../../patches/mamba/*.patch   # resolve conflicts
+# build (scripts/build.sh --from-work), run pytest tests, then:
+scripts/export_patches.sh    # rewrites patches/ from the commits on top of the tag
+# and bump the tags in versions.env
+```
+
+If a patch no longer applies, `scripts/dev/edit_*.py` are the scripted edits that produced each
+patch. Every anchor in them is asserted, so they show exactly which upstream code moved. Check
+first whether upstream has started covering a component itself, and drop that patch if so.
 
 ## Layout
 
 ```
-csrc/selective_scan/   forked selective-scan kernels (bwd kernel + host code changed)
-csrc/causal_conv1d/    forked causal conv1d kernels (channel-first, bwd changed, bug fix)
-csrc/det_reduce.cu     fixed-order reductions
-deterministic_mamba/   Python package (ops, modules, models) mirroring mamba_ssm's layout
+versions.env              pinned upstream tags
+patches/mamba/            0001-0004 (git format-patch)
+patches/causal-conv1d/    0001
+scripts/build.sh          fetch + patch + install
+scripts/export_patches.sh regenerate patches/ from work/
+scripts/dev/              edit scripts that produced the patches; limit_archs.py (build helper)
+tests/                    determinism + correctness tests
 ```
 
-The first commit vendors the unmodified upstream sources, so `git diff <first commit>` shows every
-change made for determinism.
-
-Licenses: Apache-2.0 (mamba, see `LICENSE.mamba`) and BSD-3-Clause (causal-conv1d, see
-`LICENSE.causal_conv1d`).
+The git history also holds the earlier standalone fork for mamba_ssm 2.2.4 (Mamba1 only).

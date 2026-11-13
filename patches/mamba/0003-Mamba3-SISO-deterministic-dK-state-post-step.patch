@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gehrig Wilcox <lougehrig10@gmail.com>
+Date: Thu, 12 Nov 2026 19:25:18 -0600
+Subject: [PATCH 3/4] Mamba3 SISO: deterministic dK state post-step
+
+mamba3_siso_bwd_kernel_dk_state_post accumulates dK (across query heads
+sharing a key head, GQA), dK_bias (across the batch / sequences) and
+dAngles with tl.atomic_add. With GQA > 1 or batch > 1 the summation order,
+and so the bits, vary between runs.
+
+In deterministic mode each program stores its contribution into a float32
+workspace instead, and the host adds them with fixed-order torch reductions.
+The other Mamba3 SISO atomics (dDT / dTrap first-token terms) touch each
+address exactly once and are already deterministic.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ops/triton/mamba3/mamba3_siso_bwd.py      | 59 +++++++++++++++----
+ 1 file changed, 49 insertions(+), 10 deletions(-)
+
+diff --git a/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py b/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py
+index 74ae73d..b588892 100644
+--- a/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py
++++ b/mamba_ssm/ops/triton/mamba3/mamba3_siso_bwd.py
+@@ -14,7 +14,7 @@ from einops import rearrange, repeat
+ import triton
+ import triton.language as tl
+ 
+-from mamba_ssm.utils.determinism import autotune
++from mamba_ssm.utils.determinism import autotune, use_deterministic_mode
+ from mamba_ssm.ops.triton.mamba3.utils import cos_approx, sin_approx, sigmoid_approx
+ 
+ # =============================================================================
+@@ -1070,6 +1070,8 @@ def mamba3_siso_bwd_kernel_dk_state_post(
+     dK_State, Angles, K, K_bias, Cu_Seqlens,
+     # Outputs tensors
+     dK, dK_bias, dAngles,
++    # Deterministic-mode workspaces: (num_sequences, nheads, HEADDIM_QK) and (num_sequences, nheads, HEADDIM_QK // 2)
++    WS_dK, WS_dAngles,
+     # Strides for dK_State: (num_sequences, nheads, headdim_qk)
+     stride_dk_state_batch, stride_dk_state_head, stride_dk_state_qkdim,
+     # Strides for Angles: (batch, seqlen, nheads, headdim_angles)
+@@ -1091,9 +1093,12 @@ def mamba3_siso_bwd_kernel_dk_state_post(
+     HEADDIM_QK: tl.constexpr,
+     GQA_RATIO: tl.constexpr,
+     IS_VARLEN: tl.constexpr,
++    DETERMINISTIC: tl.constexpr,
+ ):
+     """
+     Post-kernel for d_ok_state contributions.
++    In DETERMINISTIC mode nothing is accumulated here: each program stores its dk_rotated and
++    dtheta_k into WS_dK / WS_dAngles and the host reduces them in a fixed order.
+     Grid: (nheads, batch)
+     
+     Each program handles one (batch, nhead) pair and computes:
+@@ -1135,13 +1140,17 @@ def mamba3_siso_bwd_kernel_dk_state_post(
+     dk1 = -dk_state_r0 * sin_ang + dk_state_r1 * cos_ang
+     dk_rotated = tl.reshape(tl.join(dk0, dk1), [HEADDIM_QK])
+     
+-    # 1. Accumulate to dK (GQA reduction via atomic)
+-    dk_base = dK + pid_batch * stride_dk_batch + last_pos * stride_dk_seqlen + qk_head_idx * stride_dk_head
+-    tl.atomic_add(dk_base + offs_d * stride_dk_qkdim, dk_rotated, mask=offs_d < headdim_qk)
+-    
+-    # 2. Accumulate to dK_bias (batch reduction via atomic)
+-    dk_bias_base = dK_bias + pid_head * stride_dk_bias_head
+-    tl.atomic_add(dk_bias_base + offs_d * stride_dk_bias_qkdim, dk_rotated, mask=offs_d < headdim_qk)
++    ws_row = (pid_batch + pid_seq) * tl.num_programs(0) + pid_head
++    if DETERMINISTIC:
++        tl.store(WS_dK + ws_row * HEADDIM_QK + offs_d, dk_rotated)
++    else:
++        # 1. Accumulate to dK (GQA reduction via atomic)
++        dk_base = dK + pid_batch * stride_dk_batch + last_pos * stride_dk_seqlen + qk_head_idx * stride_dk_head
++        tl.atomic_add(dk_base + offs_d * stride_dk_qkdim, dk_rotated, mask=offs_d < headdim_qk)
++
++        # 2. Accumulate to dK_bias (batch reduction via atomic)
++        dk_bias_base = dK_bias + pid_head * stride_dk_bias_head
++        tl.atomic_add(dk_bias_base + offs_d * stride_dk_bias_qkdim, dk_rotated, mask=offs_d < headdim_qk)
+     
+     # 3. Compute dAngles
+     # Load K at last position (using qk_head_idx for GQA)
+@@ -1165,8 +1174,11 @@ def mamba3_siso_bwd_kernel_dk_state_post(
+                 dk_state_r1 * (K_wbias_r0 * cos_ang - K_wbias_r1 * sin_ang))
+     
+     # Accumulate to dAngles at last position
+-    da_base = dAngles + pid_batch * stride_dangles_batch + last_pos * stride_dangles_seqlen + pid_head * stride_dangles_head
+-    tl.atomic_add(da_base + offs_dr * stride_dangles_qkdim, dtheta_k, mask=offs_dr < headdim_angles)
++    if DETERMINISTIC:
++        tl.store(WS_dAngles + ws_row * (HEADDIM_QK // 2) + offs_dr, dtheta_k)
++    else:
++        da_base = dAngles + pid_batch * stride_dangles_batch + last_pos * stride_dangles_seqlen + pid_head * stride_dangles_head
++        tl.atomic_add(da_base + offs_dr * stride_dangles_qkdim, dtheta_k, mask=offs_dr < headdim_angles)
+ 
+ 
+ def compute_dqktheta(
+@@ -1383,12 +1395,20 @@ def apply_dk_state_post(
+     HEADDIM_QK = triton.next_power_of_2(headdim_qk)
+     
+     grid = (nheads, num_sequences)
++
++    deterministic = use_deterministic_mode()
++    if deterministic:
++        ws_dk = torch.empty((num_sequences, nheads, HEADDIM_QK), dtype=torch.float32, device=dk.device)
++        ws_dangles = torch.empty((num_sequences, nheads, HEADDIM_QK // 2), dtype=torch.float32, device=dk.device)
++    else:
++        ws_dk = ws_dangles = None
+     
+     mamba3_siso_bwd_kernel_dk_state_post[grid](
+         # Input tensors
+         d_ok_state, angles, k, k_bias, Cu_Seqlens,
+         # Output tensors
+         dk, dk_bias, dangles,
++        ws_dk, ws_dangles,
+         # dK_State strides: (batch, nheads, headdim_qk)
+         d_ok_state.stride(0), d_ok_state.stride(1), d_ok_state.stride(2),
+         # Angles strides: (batch, seqlen, nheads, headdim_angles)
+@@ -1410,10 +1430,29 @@ def apply_dk_state_post(
+         HEADDIM_QK=HEADDIM_QK,
+         GQA_RATIO=GQA_RATIO,
+         IS_VARLEN=is_varlen,
++        DETERMINISTIC=deterministic,
+         num_warps=2,
+         num_stages=3,
+     )
+ 
++    if deterministic:
++        # Fixed-order reductions replacing the kernel's atomics.
++        if is_varlen:
++            last_pos = (Cu_Seqlens[1:] - 1).long()
++            batch_idx = torch.zeros_like(last_pos)
++        else:
++            last_pos = torch.full((num_sequences,), seqlen - 1, dtype=torch.long, device=dk.device)
++            batch_idx = torch.arange(num_sequences, dtype=torch.long, device=dk.device)
++        dk_rot = ws_dk[..., :headdim_qk]                                  # (seq, nheads, d)
++        # dK: GQA reduction (heads h*GQA .. h*GQA+GQA-1 share qk head h)
++        dk_gqa = dk_rot.view(num_sequences, nheads_qk, GQA_RATIO, headdim_qk).sum(dim=2)
++        dk.index_put_((batch_idx, last_pos), dk_gqa.to(dk.dtype), accumulate=True)
++        # dK_bias: reduction over sequences
++        dk_bias.add_(dk_rot.sum(dim=0).to(dk_bias.dtype))
++        # dAngles: one contribution per (sequence, head)
++        dangles[..., :headdim_angles].index_put_(
++            (batch_idx, last_pos), ws_dangles[..., :headdim_angles].to(dangles.dtype), accumulate=True)
++
+ 
+ # =============================================================================
+ # dDT, dTrap, and dInput States Kernel

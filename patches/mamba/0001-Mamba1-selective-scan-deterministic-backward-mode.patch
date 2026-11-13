@@ -1,0 +1,525 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gehrig Wilcox <lougehrig10@gmail.com>
+Date: Thu, 12 Nov 2026 18:55:57 -0600
+Subject: [PATCH 1/4] Mamba1 selective scan: deterministic backward mode
+
+selective_scan_bwd accumulates dA, dB, dC, dD and ddelta_bias with
+gpuAtomicAdd, so their float summation order (and bits) change run to run.
+
+Add a deterministic mode: every (batch, channel) block stores its partial
+result into its own float32 workspace slot, and the host reduces the
+workspace with fixed-order kernels. dB/dC for input-dependent B/C are
+processed in channel slices bounded by a memory budget; the running sum
+continues across slices so the result is independent of the budget.
+
+The mode is selected per call (`deterministic` argument of
+selective_scan_cuda.bwd). The Python wrappers pass
+mamba_ssm.utils.determinism.use_deterministic_mode(), i.e.
+set_deterministic_mode() / MAMBA_DETERMINISTIC / torch's
+use_deterministic_algorithms. Default (non-deterministic) behavior is
+unchanged. Real and complex weights are supported.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ csrc/selective_scan/selective_scan.cpp        | 161 +++++++++++++++---
+ csrc/selective_scan/selective_scan.h          |   8 +
+ .../selective_scan_bwd_kernel.cuh             |  60 +++++--
+ .../selective_scan_det_reduce.cu              |  55 ++++++
+ .../selective_scan_det_reduce.h               |  14 ++
+ mamba_ssm/ops/selective_scan_interface.py     |  10 +-
+ mamba_ssm/utils/determinism.py                |   7 +
+ setup.py                                      |   1 +
+ 8 files changed, 272 insertions(+), 44 deletions(-)
+ create mode 100644 csrc/selective_scan/selective_scan_det_reduce.cu
+ create mode 100644 csrc/selective_scan/selective_scan_det_reduce.h
+
+diff --git a/csrc/selective_scan/selective_scan.cpp b/csrc/selective_scan/selective_scan.cpp
+index a97588e..6400ca7 100644
+--- a/csrc/selective_scan/selective_scan.cpp
++++ b/csrc/selective_scan/selective_scan.cpp
+@@ -8,6 +8,18 @@
+ #include <vector>
+ 
+ #include "selective_scan.h"
++#include "selective_scan_det_reduce.h"
++
++#include <algorithm>
++#include <cstdlib>
++
++// Default for callers that don't pass `deterministic`: MAMBA_DETERMINISTIC=1/0 overrides,
++// otherwise follow torch.use_deterministic_algorithms(...).
++static bool default_deterministic_mode() {
++    const char *env = std::getenv("MAMBA_DETERMINISTIC");
++    if (env != nullptr && env[0] != '\0') { return env[0] == '1'; }
++    return at::globalContext().deterministicAlgorithms();
++}
+ 
+ #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+ 
+@@ -346,7 +358,9 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
+                   const c10::optional<at::Tensor> &out_,
+                   c10::optional<at::Tensor> &dz_,
+                   bool delta_softplus,
+-                  bool recompute_out_z) {
++                  bool recompute_out_z,
++                  const c10::optional<bool> &deterministic_,
++                  int64_t workspace_mb) {
+     auto input_type = u.scalar_type();
+     auto weight_type = A.scalar_type();
+     TORCH_CHECK(input_type == at::ScalarType::Float || input_type == at::ScalarType::Half || input_type == at::ScalarType::BFloat16);
+@@ -455,36 +469,127 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
+         CHECK_SHAPE(x, batch_size, dim, n_chunks, 2 * dstate);
+     }
+ 
++    const bool deterministic = deterministic_.has_value() ? deterministic_.value() : default_deterministic_mode();
++
+     at::Tensor du = torch::empty_like(u);
+     at::Tensor ddelta = torch::empty_like(delta);
+-    at::Tensor dA = torch::zeros_like(A);
+-    at::Tensor dB = !is_variable_B ? torch::zeros_like(B) : torch::zeros_like(B, B.options().dtype(torch::kFloat32));
+-    at::Tensor dC = !is_variable_C ? torch::zeros_like(C) : torch::zeros_like(C, C.options().dtype(torch::kFloat32));
+-    at::Tensor dD;
+-    if (D_.has_value()) { dD = torch::zeros_like(D_.value()); }
+-    at::Tensor ddelta_bias;
+-    if (delta_bias_.has_value()) { ddelta_bias = torch::zeros_like(delta_bias_.value()); }
+-
+-    SSMParamsBwd params;
+-    set_ssm_params_bwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
+-                       u, delta, A, B, C, z, out, out_z,
+-                       D_.has_value() ? D_.value().data_ptr() : nullptr,
+-                       delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
+-                       x_.has_value() ? x_.value().data_ptr() : nullptr,
+-                       dout, du, ddelta, dA, dB, dC, dz,
+-                       D_.has_value() ? dD.data_ptr() : nullptr,
+-                       delta_bias_.has_value() ? ddelta_bias.data_ptr() : nullptr,
+-                       has_z, delta_softplus, recompute_out_z);
++    at::Tensor dA, dB, dC, dD, ddelta_bias;
+ 
+     // Otherwise the kernel will be launched from cuda:0 device
+     // Cast to char to avoid compiler warning about narrowing
+     at::cuda::CUDAGuard device_guard{u.device()};
+     auto stream = at::cuda::getCurrentCUDAStream().stream();
+-    DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(u.scalar_type(), "selective_scan_bwd", [&] {
+-        DISPATCH_WTYPE_FLOAT_AND_COMPLEX(A.scalar_type(), "selective_scan_bwd", [&] {
+-            selective_scan_bwd_cuda<input_t, weight_t>(params, stream);
++
++    if (!deterministic) {
++        // ---------------- Upstream path: atomic accumulation ----------------
++        dA = torch::zeros_like(A);
++        dB = !is_variable_B ? torch::zeros_like(B) : torch::zeros_like(B, B.options().dtype(torch::kFloat32));
++        dC = !is_variable_C ? torch::zeros_like(C) : torch::zeros_like(C, C.options().dtype(torch::kFloat32));
++        if (D_.has_value()) { dD = torch::zeros_like(D_.value()); }
++        if (delta_bias_.has_value()) { ddelta_bias = torch::zeros_like(delta_bias_.value()); }
++
++        SSMParamsBwd params;
++        set_ssm_params_bwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
++                           u, delta, A, B, C, z, out, out_z,
++                           D_.has_value() ? D_.value().data_ptr() : nullptr,
++                           delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
++                           x_.has_value() ? x_.value().data_ptr() : nullptr,
++                           dout, du, ddelta, dA, dB, dC, dz,
++                           D_.has_value() ? dD.data_ptr() : nullptr,
++                           delta_bias_.has_value() ? ddelta_bias.data_ptr() : nullptr,
++                           has_z, delta_softplus, recompute_out_z);
++        params.deterministic = false;
++        params.dim_offset = 0;
++        params.n_local_dims = dim;
++        DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(u.scalar_type(), "selective_scan_bwd", [&] {
++            DISPATCH_WTYPE_FLOAT_AND_COMPLEX(A.scalar_type(), "selective_scan_bwd", [&] {
++                selective_scan_bwd_cuda<input_t, weight_t>(params, stream);
++            });
+         });
+-    });
++    } else {
++        // ---------------- Deterministic path ----------------
++        // Every (batch, channel) block writes its partial gradients into its own workspace slot
++        // (no atomics); they are then reduced with fixed-order kernels.
++        auto fopts = u.options().dtype(torch::kFloat32);
++        auto wopts = A.options();  // float32 or complex64
++        at::Tensor dA_ws = torch::empty({batch_size, dim, dstate}, wopts);
++        at::Tensor dB_ws = !is_variable_B ? torch::empty({batch_size, dim, dstate}, wopts) : at::Tensor();
++        at::Tensor dC_ws = !is_variable_C ? torch::empty({batch_size, dim, dstate}, wopts) : at::Tensor();
++        at::Tensor dD_ws, ddelta_bias_ws;
++        if (D_.has_value()) { dD_ws = torch::empty({batch_size, dim}, fopts); }
++        if (delta_bias_.has_value()) { ddelta_bias_ws = torch::empty({batch_size, dim}, fopts); }
++
++        // Variable B / C: all channels of a group contribute to the same dB/dC[b, g]. Each channel
++        // writes its own row; channels are processed in slices so the workspace fits the budget.
++        const int64_t L_f = int64_t(seqlen) * (is_complex ? 2 : 1);  // float elements per row
++        at::Tensor dB_var = is_variable_B ? torch::empty({batch_size, n_groups, dstate, L_f}, fopts) : at::Tensor();
++        at::Tensor dC_var = is_variable_C ? torch::empty({batch_size, n_groups, dstate, L_f}, fopts) : at::Tensor();
++        const int ratio = dim / n_groups;
++        const int n_var = int(is_variable_B) + int(is_variable_C);
++        int slice = n_var > 0 ? ratio : dim;
++        if (n_var > 0) {
++            const int64_t per_dim_bytes = int64_t(batch_size) * dstate * L_f * 4 * n_var;
++            const int64_t budget = std::max<int64_t>(workspace_mb, 1) * 1024 * 1024;
++            slice = int(std::min<int64_t>(ratio, std::max<int64_t>(1, budget / per_dim_bytes)));
++        }
++        at::Tensor dB_slice = is_variable_B ? torch::empty({batch_size, slice, dstate, L_f}, fopts) : at::Tensor();
++        at::Tensor dC_slice = is_variable_C ? torch::empty({batch_size, slice, dstate, L_f}, fopts) : at::Tensor();
++
++        SSMParamsBwd params;
++        set_ssm_params_bwd(params, batch_size, dim, seqlen, dstate, n_groups, n_chunks, is_variable_B, is_variable_C,
++                           u, delta, A, B, C, z, out, out_z,
++                           D_.has_value() ? D_.value().data_ptr() : nullptr,
++                           delta_bias_.has_value() ? delta_bias_.value().data_ptr() : nullptr,
++                           x_.has_value() ? x_.value().data_ptr() : nullptr,
++                           dout, du, ddelta, dA_ws,
++                           is_variable_B ? dB_slice : dB_ws,
++                           is_variable_C ? dC_slice : dC_ws,
++                           dz,
++                           D_.has_value() ? dD_ws.data_ptr() : nullptr,
++                           delta_bias_.has_value() ? ddelta_bias_ws.data_ptr() : nullptr,
++                           has_z, delta_softplus, recompute_out_z);
++        params.deterministic = true;
++        // Workspace layouts (see selective_scan_bwd_kernel.cuh): the (batch, dim, dstate) ones are
++        // indexed directly by the kernel with unit dstate stride.
++        params.dA_dstate_stride = 1;
++        if (!is_variable_B) { params.dB_dstate_stride = 1; }
++        if (!is_variable_C) { params.dC_dstate_stride = 1; }
++
++        const int64_t bc_inner = int64_t(dstate) * L_f;
++        for (int g = 0; g < (n_var > 0 ? n_groups : 1); ++g) {
++            const int g_begin = n_var > 0 ? g * ratio : 0;
++            const int g_end = n_var > 0 ? (g + 1) * ratio : dim;
++            for (int d0 = g_begin; d0 < g_end; d0 += slice) {
++                const int n = std::min(slice, g_end - d0);
++                params.dim_offset = d0;
++                params.n_local_dims = n;
++                DISPATCH_ITYPE_FLOAT_AND_HALF_AND_BF16(u.scalar_type(), "selective_scan_bwd", [&] {
++                    DISPATCH_WTYPE_FLOAT_AND_COMPLEX(A.scalar_type(), "selective_scan_bwd", [&] {
++                        selective_scan_bwd_cuda<input_t, weight_t>(params, stream);
++                    });
++                });
++                // Fold this slice into dB/dC[:, g] in increasing channel order. The running sum
++                // continues across slices, so the bits don't depend on the slice size.
++                const bool accumulate = d0 != g_begin;
++                if (is_variable_B) {
++                    det_sum_middle(dB_slice.data_ptr<float>(), dB_var.data_ptr<float>() + g * bc_inner,
++                                   batch_size, n, bc_inner, dB_slice.stride(0), dB_slice.stride(1),
++                                   dB_var.stride(0), accumulate);
++                }
++                if (is_variable_C) {
++                    det_sum_middle(dC_slice.data_ptr<float>(), dC_var.data_ptr<float>() + g * bc_inner,
++                                   batch_size, n, bc_inner, dC_slice.stride(0), dC_slice.stride(1),
++                                   dC_var.stride(0), accumulate);
++                }
++            }
++        }
++        // Reduce the per-batch partials over the batch dimension in a fixed order.
++        dA = det_sum_dim0(dA_ws);
++        dB = is_variable_B ? dB_var : det_sum_dim0(dB_ws);
++        dC = is_variable_C ? dC_var : det_sum_dim0(dC_ws);
++        if (D_.has_value()) { dD = det_sum_dim0(dD_ws); }
++        if (delta_bias_.has_value()) { ddelta_bias = det_sum_dim0(ddelta_bias_ws); }
++    }
+     std::vector<at::Tensor> result = {du, ddelta, dA, dB.to(B.dtype()), dC.to(C.dtype()), dD, ddelta_bias};
+     if (has_z) { result.push_back(dz); }
+     if (recompute_out_z) { result.push_back(out_z); }
+@@ -493,5 +598,13 @@ selective_scan_bwd(const at::Tensor &u, const at::Tensor &delta,
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("fwd", &selective_scan_fwd, "Selective scan forward");
+-    m.def("bwd", &selective_scan_bwd, "Selective scan backward");
++    m.def("bwd", &selective_scan_bwd, "Selective scan backward",
++          py::arg("u"), py::arg("delta"), py::arg("A"), py::arg("B"), py::arg("C"),
++          py::arg("D"), py::arg("z"), py::arg("delta_bias"), py::arg("dout"),
++          py::arg("x"), py::arg("out"), py::arg("dz"),
++          py::arg("delta_softplus"), py::arg("recompute_out_z"),
++          // None -> MAMBA_DETERMINISTIC env var, else torch.are_deterministic_algorithms_enabled()
++          py::arg("deterministic") = py::none(),
++          // Memory budget (MiB) for the per-channel dB/dC workspace in deterministic mode.
++          py::arg("workspace_mb") = 256);
+ }
+diff --git a/csrc/selective_scan/selective_scan.h b/csrc/selective_scan/selective_scan.h
+index 630806a..1bd0903 100644
+--- a/csrc/selective_scan/selective_scan.h
++++ b/csrc/selective_scan/selective_scan.h
+@@ -50,6 +50,14 @@ struct SSMParamsBase {
+ };
+ 
+ struct SSMParamsBwd: public SSMParamsBase {
++    // Deterministic mode: instead of atomically accumulating dA, dB, dC, dD and ddelta_bias, every
++    // (batch, channel) block stores its partial result into its own slot of a float32 workspace,
++    // which the host then reduces in a fixed order (see selective_scan_det_reduce.cu). The kernel
++    // may be launched over a slice of channels [dim_offset, dim_offset + n_local_dims) so that the
++    // per-channel dB/dC workspace stays within a memory budget.
++    bool deterministic;
++    int dim_offset;
++    int n_local_dims;
+     index_t dout_batch_stride;
+     index_t dout_d_stride;
+     index_t dA_d_stride;
+diff --git a/csrc/selective_scan/selective_scan_bwd_kernel.cuh b/csrc/selective_scan/selective_scan_bwd_kernel.cuh
+index c720ba2..6af8ead 100755
+--- a/csrc/selective_scan/selective_scan_bwd_kernel.cuh
++++ b/csrc/selective_scan/selective_scan_bwd_kernel.cuh
+@@ -24,6 +24,13 @@
+ #include "reverse_scan.cuh"
+ #include "static_switch.h"
+ 
++// Accumulate into a gradient: atomically by default, or a plain store into this block's own
++// workspace slot in deterministic mode (the host reduces the workspace in a fixed order).
++template<typename T>
++__device__ __forceinline__ void det_or_atomic_add(bool deterministic, T *ptr, T val) {
++    if (deterministic) { *ptr = val; } else { gpuAtomicAdd(ptr, val); }
++}
++
+ template<typename scalar_t> __device__ __forceinline__ scalar_t conj(scalar_t x);
+ template<> __device__ __forceinline__ float conj<float>(float x) { return x; }
+ template<> __device__ __forceinline__ complex_t conj<complex_t>(complex_t x) { return std::conj(x); }
+@@ -115,7 +122,11 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
+     weight_t *smem_dbc = reinterpret_cast<weight_t *>(smem_da + MAX_DSTATE);
+ 
+     const int batch_id = blockIdx.x;
+-    const int dim_id = blockIdx.y;
++    const int local_dim_id = blockIdx.y;
++    const int dim_id = blockIdx.y + params.dim_offset;
++    const bool det = params.deterministic;
++    // Index of this block's slot in the (batch, dim) deterministic workspaces.
++    const size_t bd_idx = size_t(batch_id) * params.dim + dim_id;
+     const int group_id = dim_id / (params.dim_ngroups_ratio);
+     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
+         + dim_id * params.u_d_stride;
+@@ -128,14 +139,27 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
+     input_t *Bvar = reinterpret_cast<input_t *>(params.B_ptr) + batch_id * params.B_batch_stride + group_id * params.B_group_stride;
+     weight_t *C = reinterpret_cast<weight_t *>(params.C_ptr) + dim_id * params.C_d_stride;
+     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
+-    weight_t *dA = reinterpret_cast<weight_t *>(params.dA_ptr) + dim_id * params.dA_d_stride;
+-    weight_t *dB = reinterpret_cast<weight_t *>(params.dB_ptr)
+-        + (!kIsVariableB ? dim_id * params.dB_d_stride : batch_id * (!kIsComplex ? params.dB_batch_stride : params.dB_batch_stride / 2) + group_id * params.dB_group_stride);
+-    weight_t *dC = reinterpret_cast<weight_t *>(params.dC_ptr)
+-        + (!kIsVariableC ? dim_id * params.dC_d_stride : batch_id * (!kIsComplex ? params.dC_batch_stride : params.dC_batch_stride / 2) + group_id * params.dC_group_stride);
+-    float *dD = params.dD_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.dD_ptr) + dim_id;
++    // Deterministic workspaces (dstate strides are set to 1 by the host for the (batch, dim, dstate) ones):
++    //   dA, constant dB / dC : weight_t (batch, dim, dstate)
++    //   variable dB / dC     : float    (batch, n_local_dims, dstate, seqlen [* 2 if complex])
++    //   dD, ddelta_bias      : float    (batch, dim)
++    weight_t *dA = reinterpret_cast<weight_t *>(params.dA_ptr)
++        + (det ? bd_idx * params.dstate : size_t(dim_id) * params.dA_d_stride);
++    weight_t *dB = !det
++        ? reinterpret_cast<weight_t *>(params.dB_ptr)
++            + (!kIsVariableB ? dim_id * params.dB_d_stride : batch_id * (!kIsComplex ? params.dB_batch_stride : params.dB_batch_stride / 2) + group_id * params.dB_group_stride)
++        : (!kIsVariableB
++            ? reinterpret_cast<weight_t *>(params.dB_ptr) + bd_idx * params.dstate
++            : reinterpret_cast<weight_t *>(reinterpret_cast<float *>(params.dB_ptr) + size_t(batch_id) * params.dB_batch_stride + size_t(local_dim_id) * params.dB_group_stride));
++    weight_t *dC = !det
++        ? reinterpret_cast<weight_t *>(params.dC_ptr)
++            + (!kIsVariableC ? dim_id * params.dC_d_stride : batch_id * (!kIsComplex ? params.dC_batch_stride : params.dC_batch_stride / 2) + group_id * params.dC_group_stride)
++        : (!kIsVariableC
++            ? reinterpret_cast<weight_t *>(params.dC_ptr) + bd_idx * params.dstate
++            : reinterpret_cast<weight_t *>(reinterpret_cast<float *>(params.dC_ptr) + size_t(batch_id) * params.dC_batch_stride + size_t(local_dim_id) * params.dC_group_stride));
++    float *dD = params.dD_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.dD_ptr) + (det ? bd_idx : size_t(dim_id));
+     float D_val = params.D_ptr == nullptr ? 0 : reinterpret_cast<float *>(params.D_ptr)[dim_id];
+-    float *ddelta_bias = params.ddelta_bias_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.ddelta_bias_ptr) + dim_id;
++    float *ddelta_bias = params.ddelta_bias_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.ddelta_bias_ptr) + (det ? bd_idx : size_t(dim_id));
+     float delta_bias = params.delta_bias_ptr == nullptr ? 0 : reinterpret_cast<float *>(params.delta_bias_ptr)[dim_id];
+     scan_t *x = params.x_ptr == nullptr
+         ? nullptr
+@@ -315,8 +339,8 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
+                     #pragma unroll
+                     for (int i = 0; i < kNItems; ++i) {
+                         if (i * kNThreads < seqlen_remaining) {
+-                            if constexpr (kIsVariableB) { gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals[i]); }
+-                            if constexpr (kIsVariableC) { gpuAtomicAdd(dC_cur + i * kNThreads, dC_vals[i]); }
++                            if constexpr (kIsVariableB) { det_or_atomic_add(det, dB_cur + i * kNThreads, dB_vals[i]); }
++                            if constexpr (kIsVariableC) { det_or_atomic_add(det, dC_cur + i * kNThreads, dC_vals[i]); }
+                         }
+                     }
+                 }
+@@ -420,8 +444,8 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
+                     #pragma unroll
+                     for (int i = 0; i < kNItems * 2; ++i) {
+                         if (i * kNThreads < seqlen_remaining) {
+-                            if constexpr (kIsVariableB) { gpuAtomicAdd(dB_cur + i * kNThreads, dB_vals_f[i]); }
+-                            if constexpr (kIsVariableC) { gpuAtomicAdd(dC_cur + i * kNThreads, dC_vals_f[i]); }
++                            if constexpr (kIsVariableB) { det_or_atomic_add(det, dB_cur + i * kNThreads, dB_vals_f[i]); }
++                            if constexpr (kIsVariableC) { det_or_atomic_add(det, dC_cur + i * kNThreads, dC_vals_f[i]); }
+                         }
+                     }
+                 }
+@@ -472,23 +496,23 @@ void selective_scan_bwd_kernel(SSMParamsBwd params) {
+     }
+     if (params.dD_ptr != nullptr) {
+         dD_val = typename Ktraits::BlockReduceFloatT(smem_reduce_float).Sum(dD_val);
+-        if (threadIdx.x == 0) { gpuAtomicAdd(dD, dD_val); }
++        if (threadIdx.x == 0) { det_or_atomic_add(det, dD, dD_val); }
+     }
+     if (params.ddelta_bias_ptr != nullptr) {
+         __syncthreads();
+         ddelta_bias_val = typename Ktraits::BlockReduceFloatT(smem_reduce_float).Sum(ddelta_bias_val);
+-        if (threadIdx.x == 0) { gpuAtomicAdd(ddelta_bias, ddelta_bias_val); }
++        if (threadIdx.x == 0) { det_or_atomic_add(det, ddelta_bias, ddelta_bias_val); }
+     }
+     for (int state_idx = threadIdx.x; state_idx < params.dstate; state_idx += blockDim.x) {
+-        gpuAtomicAdd(&(dA[state_idx * params.dA_dstate_stride]), smem_da[state_idx]);
++        det_or_atomic_add<weight_t>(det, &(dA[state_idx * params.dA_dstate_stride]), smem_da[state_idx]);
+         weight_t dBC_val;
+         if (!kIsVariableB || !kIsVariableC) { dBC_val = smem_dbc[state_idx]; }
+         if constexpr (!kIsVariableB) {
+-            gpuAtomicAdd(&(dB[state_idx * params.dB_dstate_stride]),
++            det_or_atomic_add<weight_t>(det, &(dB[state_idx * params.dB_dstate_stride]),
+                          !kIsVariableC ? dBC_val * conj(C[state_idx * params.C_dstate_stride]) : dBC_val);
+         }
+         if constexpr (!kIsVariableC) {
+-            gpuAtomicAdd(&(dC[state_idx * params.dC_dstate_stride]),
++            det_or_atomic_add<weight_t>(det, &(dC[state_idx * params.dC_dstate_stride]),
+                         !kIsVariableB ? dBC_val * conj(B[state_idx * params.B_dstate_stride]) : dBC_val);
+         }
+     }
+@@ -506,7 +530,7 @@ void selective_scan_bwd_launch(SSMParamsBwd &params, cudaStream_t stream) {
+                         // TODO: check this
+                         constexpr int kSmemSize = Ktraits::kSmemSize + MAX_DSTATE * sizeof(typename Ktraits::scan_t) + (kNThreads + 4 * MAX_DSTATE) * sizeof(typename Ktraits::weight_t);
+ 
+-                        dim3 grid(params.batch, params.dim);
++                        dim3 grid(params.batch, params.n_local_dims);
+                         
+                         auto kernel = &selective_scan_bwd_kernel<Ktraits>;
+ 
+diff --git a/csrc/selective_scan/selective_scan_det_reduce.cu b/csrc/selective_scan/selective_scan_det_reduce.cu
+new file mode 100644
+index 0000000..8bd8c6c
+--- /dev/null
++++ b/csrc/selective_scan/selective_scan_det_reduce.cu
+@@ -0,0 +1,55 @@
++/******************************************************************************
++ * Fixed-order reductions for the deterministic selective-scan backward.
++ * One thread owns one output element and adds its inputs sequentially, so the
++ * floating point result depends only on the data, never on scheduling.
++ ******************************************************************************/
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAException.h>
++
++#include "selective_scan_det_reduce.h"
++
++__global__ void det_sum_middle_kernel(const float *__restrict__ in, float *__restrict__ out,
++                                      int64_t outer, int64_t N, int64_t inner,
++                                      int64_t in_outer_stride, int64_t in_n_stride,
++                                      int64_t out_outer_stride, bool accumulate) {
++    const int64_t total = outer * inner;
++    for (int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
++         idx += int64_t(gridDim.x) * blockDim.x) {
++        const int64_t o = idx / inner;
++        const int64_t i = idx - o * inner;
++        const float *src = in + o * in_outer_stride + i;
++        float *dst = out + o * out_outer_stride + i;
++        float acc = accumulate ? *dst : 0.f;
++        for (int64_t n = 0; n < N; ++n) { acc += src[n * in_n_stride]; }
++        *dst = acc;
++    }
++}
++
++void det_sum_middle(const float *in_ptr, float *out_ptr,
++                    int64_t outer, int64_t N, int64_t inner,
++                    int64_t in_outer_stride, int64_t in_n_stride, int64_t out_outer_stride,
++                    bool accumulate) {
++    const int64_t total = outer * inner;
++    if (total == 0) { return; }
++    constexpr int kThreads = 256;
++    const int64_t blocks = std::min<int64_t>((total + kThreads - 1) / kThreads, 65535);
++    auto stream = at::cuda::getCurrentCUDAStream().stream();
++    det_sum_middle_kernel<<<blocks, kThreads, 0, stream>>>(
++        in_ptr, out_ptr, outer, N, inner, in_outer_stride, in_n_stride, out_outer_stride, accumulate);
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++at::Tensor det_sum_dim0(const at::Tensor &in) {
++    TORCH_CHECK(in.is_contiguous() && in.dim() >= 1);
++    // Complex tensors are reduced component-wise through their float view.
++    at::Tensor in_f = in.is_complex() ? at::view_as_real(in) : in;
++    TORCH_CHECK(in_f.scalar_type() == at::kFloat);
++    auto out_sizes = in_f.sizes().vec();
++    const int64_t N = out_sizes[0];
++    out_sizes.erase(out_sizes.begin());
++    at::Tensor out = at::empty(out_sizes, in_f.options());
++    const int64_t inner = out.numel();
++    det_sum_middle(in_f.data_ptr<float>(), out.data_ptr<float>(), 1, N, inner, 0, inner, 0, false);
++    return in.is_complex() ? at::view_as_complex(out) : out;
++}
+diff --git a/csrc/selective_scan/selective_scan_det_reduce.h b/csrc/selective_scan/selective_scan_det_reduce.h
+new file mode 100644
+index 0000000..cf81768
+--- /dev/null
++++ b/csrc/selective_scan/selective_scan_det_reduce.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <ATen/ATen.h>
++
++// out[o, i] (+)= sum_{n=0}^{N-1} in[o, n, i], added sequentially in increasing n (fp32).
++// With accumulate=true the running sum starts from out's current value, so reducing consecutive
++// slices of n gives the same bits as reducing them all at once.
++void det_sum_middle(const float *in_ptr, float *out_ptr,
++                    int64_t outer, int64_t N, int64_t inner,
++                    int64_t in_outer_stride, int64_t in_n_stride, int64_t out_outer_stride,
++                    bool accumulate);
++
++// Fixed-order sum of a contiguous float32 / complex64 tensor over dimension 0.
++at::Tensor det_sum_dim0(const at::Tensor &in);
+diff --git a/mamba_ssm/ops/selective_scan_interface.py b/mamba_ssm/ops/selective_scan_interface.py
+index a41f135..d914d50 100644
+--- a/mamba_ssm/ops/selective_scan_interface.py
++++ b/mamba_ssm/ops/selective_scan_interface.py
+@@ -19,6 +19,8 @@ from mamba_ssm.ops.triton.layer_norm import _layer_norm_fwd
+ 
+ import selective_scan_cuda
+ 
++from mamba_ssm.utils.determinism import use_deterministic_mode, selective_scan_workspace_mb
++
+ 
+ class SelectiveScanFn(torch.autograd.Function):
+ 
+@@ -70,7 +72,9 @@ class SelectiveScanFn(torch.autograd.Function):
+         # Here we just pass in None and dz will be allocated in the C++ code.
+         du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(
+             u, delta, A, B, C, D, z, delta_bias, dout, x, out, None, ctx.delta_softplus,
+-            False  # option to recompute out_z, not used here
++            False,  # option to recompute out_z, not used here
++            deterministic=use_deterministic_mode(),
++            workspace_mb=selective_scan_workspace_mb(),
+         )
+         dz = rest[0] if ctx.has_z else None
+         dB = dB.squeeze(1) if getattr(ctx, "squeeze_B", False) else dB
+@@ -324,7 +328,9 @@ class MambaInnerFn(torch.autograd.Function):
+         dconv1d_out, ddelta, dA, dB, dC, dD, ddelta_bias, dz, out_z = selective_scan_cuda.bwd(
+             conv1d_out, delta, A, B, C, D, z, delta_bias, dout_y, scan_intermediates, out, dz,
+             ctx.delta_softplus,
+-            True  # option to recompute out_z
++            True,  # option to recompute out_z
++            deterministic=use_deterministic_mode(),
++            workspace_mb=selective_scan_workspace_mb(),
+         )
+         dout_proj_weight = torch.einsum("eB,dB->ed", dout, rearrange(out_z, "b d l -> d (b l)"))
+         dout_proj_bias = dout.sum(dim=(0, 1)) if not ctx.out_proj_bias_is_None else None
+diff --git a/mamba_ssm/utils/determinism.py b/mamba_ssm/utils/determinism.py
+index c6066f8..3e19775 100644
+--- a/mamba_ssm/utils/determinism.py
++++ b/mamba_ssm/utils/determinism.py
+@@ -32,6 +32,13 @@ def set_deterministic_mode(value):
+     _deterministic_override = value
+ 
+ 
++def selective_scan_workspace_mb():
++    """Memory budget (MiB) for the per-channel dB/dC workspace of the deterministic Mamba1
++    selective-scan backward (MAMBA_DETERMINISTIC_WORKSPACE_MB, default 256). Larger is faster;
++    the result is bitwise identical for any value."""
++    return int(os.environ.get("MAMBA_DETERMINISTIC_WORKSPACE_MB", "256"))
++
++
+ def _estimate_config_cost(cfg):
+     """Estimate shared memory cost of a config. Lower is cheaper."""
+     block_product = 1
+diff --git a/setup.py b/setup.py
+index f9c3320..3b0452b 100755
+--- a/setup.py
++++ b/setup.py
+@@ -249,6 +249,7 @@ if not SKIP_CUDA_BUILD:
+             name="selective_scan_cuda",
+             sources=[
+                 "csrc/selective_scan/selective_scan.cpp",
++                "csrc/selective_scan/selective_scan_det_reduce.cu",
+                 "csrc/selective_scan/selective_scan_fwd_fp32.cu",
+                 "csrc/selective_scan/selective_scan_fwd_fp16.cu",
+                 "csrc/selective_scan/selective_scan_fwd_bf16.cu",
